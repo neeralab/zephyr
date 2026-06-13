@@ -213,6 +213,10 @@ static int smp_shell_tx_raw(const void *data, int len)
 {
 	const uint8_t *out = data;
 
+	if (shell_uart == NULL || shell_uart->dev == NULL) {
+		return -ENODEV;
+	}
+
 	while ((out != NULL) && (len != 0)) {
 		uart_poll_out(shell_uart->dev, *out);
 		++out;
@@ -225,8 +229,21 @@ static int smp_shell_tx_raw(const void *data, int len)
 static int smp_shell_tx_pkt(struct net_buf *nb)
 {
 	int rc;
+	const struct shell *sh = shell_backend_uart_get_ptr();
+	struct shell_uart_common *common;
 
-	shell_uart = (struct shell_uart_common *)shell_backend_uart_get_ptr()->iface->ctx;
+	if (sh->iface == NULL || sh->iface->ctx == NULL) {
+		smp_packet_free(nb);
+		return -ENODEV;
+	}
+
+	common = (struct shell_uart_common *)sh->iface->ctx;
+	if (common->dev == NULL) {
+		smp_packet_free(nb);
+		return -ENODEV;
+	}
+
+	shell_uart = common;
 	rc = mcumgr_serial_tx_pkt(nb->data, nb->len, smp_shell_tx_raw);
 	smp_packet_free(nb);
 

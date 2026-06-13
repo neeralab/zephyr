@@ -621,6 +621,35 @@ void HAL_PCD_DataOutStageCallback(stm32_pcd_handle_t *hpcd, uint8_t epnum)
 	}
 }
 
+/*
+ * ISO OUT incomplete: host sent in wrong even/odd frame or no packet arrived.
+ * Re-arm the endpoint so the next microframe can be accepted.
+ * Without this the ISO OUT endpoint silently deadlocks: ep_busy stays true,
+ * DataOutStageCallback never fires, UAC2 double-queued atomics stay set.
+ *
+ * This fires at up to 8000 Hz at HS — never log unconditionally from ISR.
+ */
+void HAL_PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
+{
+	struct udc_stm32_data *priv = hpcd2data(hpcd);
+	const struct device *dev = priv->dev;
+	struct udc_ep_config *ep_cfg;
+	struct net_buf *buf;
+	uint8_t ep = epnum | USB_EP_DIR_OUT;
+
+	ep_cfg = udc_get_ep_cfg(dev, ep);
+	if (ep_cfg == NULL) {
+		return;
+	}
+
+	buf = udc_buf_peek(ep_cfg);
+	if (buf != NULL) {
+		udc_stm32_initiate_ep_rx(dev, ep_cfg, buf);
+	} else {
+		udc_ep_set_busy(ep_cfg, false);
+	}
+}
+
 static void handle_msg_data_out(struct udc_stm32_data *priv, uint8_t epnum, uint16_t rx_count)
 {
 	const struct device *dev = priv->dev;
@@ -1440,6 +1469,12 @@ static int udc_stm32_driver_preinit(const struct device *dev)
 	struct udc_data *data = dev->data;
 	int err;
 
+#if !defined(CONFIG_XIP) && (CONFIG_SRAM_BASE_ADDRESS == 0xc0000000) && \
+	defined(CONFIG_BOOTLOADER_MCUBOOT) && defined(CONFIG_USE_SEGGER_RTT)
+#include <SEGGER_RTT.h>
+	SEGGER_RTT_WriteString(0, "NEERA RTT udc init\n");
+#endif
+
 	for (unsigned int i = 0; i < cfg->num_endpoints; i++) {
 		udc_stm32_init_ep_addr_caps(cfg->out_eps + i, USB_EP_DIR_OUT | i);
 		if (i == 0) {
@@ -1526,6 +1561,11 @@ static int udc_stm32_driver_preinit(const struct device *dev)
 			return -EIO;
 		}
 	}
+
+#if !defined(CONFIG_XIP) && (CONFIG_SRAM_BASE_ADDRESS == 0xc0000000) && \
+	defined(CONFIG_BOOTLOADER_MCUBOOT) && defined(CONFIG_USE_SEGGER_RTT)
+	SEGGER_RTT_WriteString(0, "NEERA RTT udc ok\n");
+#endif
 
 	return 0;
 }
