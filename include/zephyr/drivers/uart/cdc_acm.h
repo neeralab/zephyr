@@ -48,13 +48,6 @@ typedef void (*cdc_dte_rate_callback_t)(const struct device *dev,
 __deprecated int cdc_acm_dte_rate_callback_set(const struct device *dev,
 				  cdc_dte_rate_callback_t callback);
 
-#if defined(CONFIG_USBD_CDC_ACM_CLASS)
-void cdc_acm_uart_tx_recover(const struct device *dev);
-void cdc_acm_uart_rx_recover(const struct device *dev);
-void cdc_acm_uart_tx_drain(const struct device *dev, int timeout_ms);
-void cdc_acm_uart_tx_discard(const struct device *dev);
-#endif
-
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
