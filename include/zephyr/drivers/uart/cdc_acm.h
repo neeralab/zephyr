@@ -48,6 +48,19 @@ typedef void (*cdc_dte_rate_callback_t)(const struct device *dev,
 __deprecated int cdc_acm_dte_rate_callback_set(const struct device *dev,
 				  cdc_dte_rate_callback_t callback);
 
+#if defined(CONFIG_USBD_CDC_ACM_CLASS)
+/**
+ * @brief Write a buffer to the CDC ACM TX path.
+ *
+ * When @kconfig{USBD_CDC_ACM_WORKQUEUE} is enabled, this may be called from any
+ * thread: the data is copied and transmitted on the CDC workqueue. Returns
+ * -EBUSY if a previous async write is still pending (caller should drop).
+ *
+ * @return Bytes accepted, or negative errno.
+ */
+int cdc_acm_uart_write(const struct device *dev, const uint8_t *data, size_t len);
+#endif
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

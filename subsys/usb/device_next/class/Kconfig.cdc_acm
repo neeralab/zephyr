@@ -29,6 +29,15 @@ config USBD_CDC_ACM_STACK_SIZE
 	help
 	  USB CDC ACM workqueue stack size.
 
+config USBD_CDC_ACM_WORKQUEUE_PRIORITY
+	int "USB CDC ACM workqueue thread priority"
+	depends on USBD_CDC_ACM_WORKQUEUE
+	default 8
+	help
+	  Preemptive priority for the CDC ACM workqueue. Must be lower precedence
+	  (higher number) than RS485 msg_rx so DEBUG stream TX does not starve
+	  UART parsing. Do not use the system workqueue cooperative priority (-1).
+
 config USBD_CDC_ACM_BUF_POOL
 	bool "Use dedicated buffer pool"
 	default y if !USBD_MAX_SPEED_FULL

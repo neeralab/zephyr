@@ -448,8 +448,17 @@ static int udc_stm32_tx(const struct device *dev, struct udc_ep_config *ep_cfg,
 		len = MIN(UDC_STM32_EP0_MAX_PACKET_SIZE, buf->len);
 	}
 
-	buf->data += len;
-	buf->len -= len;
+	/*
+	 * For isochronous IN, keep net_buf state until the transfer completes.
+	 * On HS the host may poll feedback every microframe while the device
+	 * only commits a packet on some frames; IISOIXFR can abort a transfer
+	 * that never left the device. If len is consumed here, the retry sends
+	 * a zero-length ISO IN and the host sees feedback=0 forever.
+	 */
+	if (!ep_cfg->caps.iso) {
+		buf->data += len;
+		buf->len -= len;
+	}
 
 	status = hal_udc_set_endpoint_transmit(&priv->pcd, ep_cfg->addr, data, len);
 	if (status != HAL_OK) {
@@ -647,6 +656,32 @@ void HAL_PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 		udc_stm32_initiate_ep_rx(dev, ep_cfg, buf);
 	} else {
 		udc_ep_set_busy(ep_cfg, false);
+	}
+}
+
+/*
+ * ISO IN incomplete: host polled in a microframe where this endpoint had no
+ * packet ready (common for UAC2 feedback when host_iv=1 but desc_iv=4).
+ * Re-arm the pending IN buffer so the next microframe can carry feedback.
+ */
+void HAL_PCD_ISOINIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
+{
+	struct udc_stm32_data *priv = hpcd2data(hpcd);
+	const struct device *dev = priv->dev;
+	struct udc_ep_config *ep_cfg;
+	struct net_buf *buf;
+	uint8_t ep = epnum | USB_EP_DIR_IN;
+
+	ep_cfg = udc_get_ep_cfg(dev, ep);
+	if (ep_cfg == NULL) {
+		return;
+	}
+
+	udc_ep_set_busy(ep_cfg, false);
+
+	buf = udc_buf_peek(ep_cfg);
+	if (buf != NULL) {
+		(void)udc_stm32_tx(dev, ep_cfg, buf);
 	}
 }
 

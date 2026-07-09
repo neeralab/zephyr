@@ -47,6 +47,7 @@ LOG_MODULE_REGISTER(usbd_cdc_acm, CONFIG_USBD_CDC_ACM_LOG_LEVEL);
 #define CDC_ACM_IRQ_TX_ENABLED		3
 #define CDC_ACM_RX_FIFO_BUSY		4
 #define CDC_ACM_TX_FIFO_BUSY		5
+#define CDC_ACM_ASYNC_TX_MAX		512U
 
 struct cdc_acm_uart_fifo {
 	struct ring_buf *rb;
@@ -123,6 +124,11 @@ struct cdc_acm_uart_data {
 	struct k_work_delayable tx_fifo_work;
 	/* USBD CDC ACM RX fifo work */
 	struct k_work rx_fifo_work;
+#if CONFIG_USBD_CDC_ACM_WORKQUEUE
+	struct k_work async_tx_work;
+	uint16_t async_tx_len;
+	uint8_t async_tx_buf[CDC_ACM_ASYNC_TX_MAX];
+#endif
 	atomic_t state;
 	struct k_sem notif_sem;
 	struct k_spinlock lock;
@@ -178,8 +184,8 @@ static int usbd_cdc_acm_init_wq(void)
 	k_work_queue_init(&cdc_acm_work_q);
 	k_work_queue_start(&cdc_acm_work_q, cdc_acm_stack,
 			   K_KERNEL_STACK_SIZEOF(cdc_acm_stack),
-			   CONFIG_SYSTEM_WORKQUEUE_PRIORITY, NULL);
-	k_thread_name_set(cdc_acm_work_q.thread_id, "cdc_acm_work_q");
+			   CONFIG_USBD_CDC_ACM_WORKQUEUE_PRIORITY, NULL);
+	k_thread_name_set(&cdc_acm_work_q.thread_id, "cdc_acm_work_q");
 
 	return 0;
 }
@@ -218,6 +224,76 @@ static ALWAYS_INLINE int cdc_acm_work_schedule(struct k_work_delayable *work,
 #define check_wq_ctx(dev) true
 
 #endif /* CONFIG_USBD_CDC_ACM_WORKQUEUE */
+
+static size_t cdc_acm_tx_put_bytes(struct cdc_acm_uart_data *data, const uint8_t *buf, size_t len)
+{
+	size_t pos = 0U;
+
+	while (pos < len) {
+		k_spinlock_key_t key = k_spin_lock(&data->lock);
+		const size_t put = ring_buf_put(data->tx_fifo.rb, buf + pos, len - pos);
+
+		k_spin_unlock(&data->lock, key);
+
+		if (put == 0U) {
+			break;
+		}
+
+		pos += put;
+	}
+
+	if (pos > 0U) {
+		data->tx_fifo.altered = true;
+
+		if (data->echo_mitigated &&
+		    !k_work_delayable_is_pending(&data->tx_fifo_work)) {
+			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+		}
+	}
+
+	return pos;
+}
+
+#if CONFIG_USBD_CDC_ACM_WORKQUEUE
+static void cdc_acm_async_tx_handler(struct k_work *work)
+{
+	struct cdc_acm_uart_data *data = CONTAINER_OF(work, struct cdc_acm_uart_data, async_tx_work);
+	const size_t len = data->async_tx_len;
+
+	data->async_tx_len = 0U;
+	(void)cdc_acm_tx_put_bytes(data, data->async_tx_buf, len);
+}
+#endif
+
+int cdc_acm_uart_write(const struct device *dev, const uint8_t *data, size_t len)
+{
+	struct cdc_acm_uart_data *const ud = dev->data;
+
+	if (data == NULL || len == 0U) {
+		return -EINVAL;
+	}
+
+	if (len > CDC_ACM_ASYNC_TX_MAX) {
+		return -EMSGSIZE;
+	}
+
+#if CONFIG_USBD_CDC_ACM_WORKQUEUE
+	if (check_wq_ctx(dev)) {
+		return (int)cdc_acm_tx_put_bytes(ud, data, len);
+	}
+
+	if (k_work_busy_get(&ud->async_tx_work) != 0) {
+		return -EBUSY;
+	}
+
+	memcpy(ud->async_tx_buf, data, len);
+	ud->async_tx_len = len;
+
+	return cdc_acm_work_submit(&ud->async_tx_work) == 0 ? (int)len : -EIO;
+#else
+	return (int)cdc_acm_tx_put_bytes(ud, data, len);
+#endif
+}
 
 static uint8_t cdc_acm_get_int_in(struct usbd_class_data *const c_data)
 {
@@ -1154,6 +1230,9 @@ static int usbd_cdc_acm_preinit(const struct device *dev)
 	k_work_init_delayable(&data->tx_fifo_work, cdc_acm_tx_fifo_handler);
 	k_work_init(&data->rx_fifo_work, cdc_acm_rx_fifo_handler);
 	k_work_init(&data->irq_cb_work, cdc_acm_irq_cb_handler);
+#if CONFIG_USBD_CDC_ACM_WORKQUEUE
+	k_work_init(&data->async_tx_work, cdc_acm_async_tx_handler);
+#endif
 
 	cdc_acm_update_uart_cfg(data);
 
