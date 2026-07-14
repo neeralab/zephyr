@@ -162,6 +162,8 @@ enum udc_stm32_msg_type {
 	UDC_STM32_MSG_SETUP,
 	UDC_STM32_MSG_DATA_OUT,
 	UDC_STM32_MSG_DATA_IN,
+	UDC_STM32_MSG_ISO_OUT_INCOMPLETE,
+	UDC_STM32_MSG_ISO_IN_INCOMPLETE,
 };
 
 struct udc_stm32_msg {
@@ -637,25 +639,30 @@ void HAL_PCD_DataOutStageCallback(stm32_pcd_handle_t *hpcd, uint8_t epnum)
  * DataOutStageCallback never fires, UAC2 double-queued atomics stay set.
  *
  * This fires at up to 8000 Hz at HS — never log unconditionally from ISR.
+ *
+ * Deferred to the driver thread via msgq_data rather than calling
+ * udc_stm32_initiate_ep_rx() directly from ISR context: that function (and
+ * handle_msg_data_out()'s own call to it) mutates HAL endpoint bookkeeping
+ * (xfer_buff/xfer_len/xfer_count) and DOEPTSIZ/DOEPCTL with no lock. Calling
+ * it here too raced with the thread doing the same for the same endpoint —
+ * confirmed on hardware as an eventual net_buf_simple_tailroom assertion
+ * (rx_count corrupted above the armed buffer size) after sustained HS
+ * isochronous OUT traffic. Every other endpoint-state mutation in this
+ * driver already goes through msgq_data/udc_stm32_thread_handler; this
+ * callback must too.
  */
 void HAL_PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 {
 	struct udc_stm32_data *priv = hpcd2data(hpcd);
-	const struct device *dev = priv->dev;
-	struct udc_ep_config *ep_cfg;
-	struct net_buf *buf;
-	uint8_t ep = epnum | USB_EP_DIR_OUT;
+	struct udc_stm32_msg msg = {
+		.type = UDC_STM32_MSG_ISO_OUT_INCOMPLETE,
+		.ep = epnum,
+	};
+	int err;
 
-	ep_cfg = udc_get_ep_cfg(dev, ep);
-	if (ep_cfg == NULL) {
-		return;
-	}
-
-	buf = udc_buf_peek(ep_cfg);
-	if (buf != NULL) {
-		udc_stm32_initiate_ep_rx(dev, ep_cfg, buf);
-	} else {
-		udc_ep_set_busy(ep_cfg, false);
+	err = k_msgq_put(&priv->msgq_data, &msg, K_NO_WAIT);
+	if (err != 0) {
+		LOG_ERR("UDC Message queue overrun");
 	}
 }
 
@@ -663,25 +670,24 @@ void HAL_PCD_ISOOUTIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
  * ISO IN incomplete: host polled in a microframe where this endpoint had no
  * packet ready (common for UAC2 feedback when host_iv=1 but desc_iv=4).
  * Re-arm the pending IN buffer so the next microframe can carry feedback.
+ *
+ * Deferred to the driver thread for the same reason as
+ * HAL_PCD_ISOOUTIncompleteCallback above — udc_stm32_tx() mutates the same
+ * kind of unsynchronized HAL endpoint state that handle_msg_data_in() also
+ * touches for this endpoint.
  */
 void HAL_PCD_ISOINIncompleteCallback(PCD_HandleTypeDef *hpcd, uint8_t epnum)
 {
 	struct udc_stm32_data *priv = hpcd2data(hpcd);
-	const struct device *dev = priv->dev;
-	struct udc_ep_config *ep_cfg;
-	struct net_buf *buf;
-	uint8_t ep = epnum | USB_EP_DIR_IN;
+	struct udc_stm32_msg msg = {
+		.type = UDC_STM32_MSG_ISO_IN_INCOMPLETE,
+		.ep = epnum,
+	};
+	int err;
 
-	ep_cfg = udc_get_ep_cfg(dev, ep);
-	if (ep_cfg == NULL) {
-		return;
-	}
-
-	udc_ep_set_busy(ep_cfg, false);
-
-	buf = udc_buf_peek(ep_cfg);
-	if (buf != NULL) {
-		(void)udc_stm32_tx(dev, ep_cfg, buf);
+	err = k_msgq_put(&priv->msgq_data, &msg, K_NO_WAIT);
+	if (err != 0) {
+		LOG_ERR("UDC Message queue overrun");
 	}
 }
 
@@ -810,6 +816,48 @@ static void handle_msg_data_in(struct udc_stm32_data *priv, uint8_t epnum)
 	}
 }
 
+/* Thread-context counterpart of HAL_PCD_ISOOUTIncompleteCallback() above. */
+static void handle_msg_iso_out_incomplete(struct udc_stm32_data *priv, uint8_t epnum)
+{
+	const struct device *dev = priv->dev;
+	struct udc_ep_config *ep_cfg;
+	struct net_buf *buf;
+	uint8_t ep = epnum | USB_EP_DIR_OUT;
+
+	ep_cfg = udc_get_ep_cfg(dev, ep);
+	if (ep_cfg == NULL) {
+		return;
+	}
+
+	buf = udc_buf_peek(ep_cfg);
+	if (buf != NULL) {
+		udc_stm32_initiate_ep_rx(dev, ep_cfg, buf);
+	} else {
+		udc_ep_set_busy(ep_cfg, false);
+	}
+}
+
+/* Thread-context counterpart of HAL_PCD_ISOINIncompleteCallback() above. */
+static void handle_msg_iso_in_incomplete(struct udc_stm32_data *priv, uint8_t epnum)
+{
+	const struct device *dev = priv->dev;
+	struct udc_ep_config *ep_cfg;
+	struct net_buf *buf;
+	uint8_t ep = epnum | USB_EP_DIR_IN;
+
+	ep_cfg = udc_get_ep_cfg(dev, ep);
+	if (ep_cfg == NULL) {
+		return;
+	}
+
+	udc_ep_set_busy(ep_cfg, false);
+
+	buf = udc_buf_peek(ep_cfg);
+	if (buf != NULL) {
+		(void)udc_stm32_tx(dev, ep_cfg, buf);
+	}
+}
+
 void HAL_PCD_SetupStageCallback(stm32_pcd_handle_t *hpcd)
 {
 	struct udc_stm32_data *priv = hpcd2data(hpcd);
@@ -847,6 +895,12 @@ static void udc_stm32_thread_handler(void *arg1, void *arg2, void *arg3)
 			break;
 		case UDC_STM32_MSG_DATA_OUT:
 			handle_msg_data_out(priv, msg.ep, msg.rx_count);
+			break;
+		case UDC_STM32_MSG_ISO_OUT_INCOMPLETE:
+			handle_msg_iso_out_incomplete(priv, msg.ep);
+			break;
+		case UDC_STM32_MSG_ISO_IN_INCOMPLETE:
+			handle_msg_iso_in_incomplete(priv, msg.ep);
 			break;
 		}
 	}

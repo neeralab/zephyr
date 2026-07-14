@@ -24,6 +24,22 @@ LOG_MODULE_REGISTER(usbd_uac2, CONFIG_USBD_UAC2_LOG_LEVEL);
 
 #define DT_DRV_COMPAT zephyr_uac2
 
+/*
+ * If neither of the two in-flight feedback writes (fb_queued/fb_double) has
+ * been acknowledged by the host within this long, assume the host has
+ * stopped polling the feedback endpoint (observed: some hosts read it a
+ * couple of times at stream start then never again) and force recovery in
+ * uac2_sof() rather than waiting forever.
+ *
+ * Deliberately not aggressive: if the host genuinely never reads this
+ * endpoint, retrying faster buys nothing (it isn't about to start), it just
+ * runs usbd_ep_dequeue()+requeue more often on the SOF path for no benefit.
+ * Slow enough to keep that hardware-touching recovery action infrequent,
+ * fast enough to recover promptly if a host that does read it intermittently
+ * (rather than never) drops a read.
+ */
+#define UAC2_FEEDBACK_STALL_TIMEOUT_MS 500U
+
 #define COUNT_UAC2_AS_ENDPOINT_BUFFERS(node)					\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uac2_audio_streaming), (	\
 		+ AS_HAS_ISOCHRONOUS_DATA_ENDPOINT(node)			\
@@ -89,6 +105,17 @@ struct uac2_ctx {
 	atomic_t as_double;
 	uint32_t fb_queued;
 	uint32_t fb_double;
+	/*
+	 * Uptime (ms) at which fb_queued was first set for this AS interface
+	 * (i.e. when the oldest still-pending feedback write was submitted).
+	 * Used to detect a host that never reads the feedback endpoint: with
+	 * both fb_queued and fb_double set, uac2_sof() would otherwise wait
+	 * forever for a completion that never comes, permanently starving the
+	 * host of any further feedback value. See UAC2_FEEDBACK_STALL_TIMEOUT_MS.
+	 * Fixed-size array (not per-instance alloc) — plenty for any real UAC2
+	 * device's AS interface count.
+	 */
+	uint32_t fb_queued_since_ms[8];
 };
 
 /* UAC2 device constant data */
@@ -451,6 +478,9 @@ static void write_explicit_feedback(struct usbd_class_data *const c_data,
 			ctx->fb_double |= BIT(as_idx);
 		} else {
 			ctx->fb_queued |= BIT(as_idx);
+			if ((size_t)as_idx < ARRAY_SIZE(ctx->fb_queued_since_ms)) {
+				ctx->fb_queued_since_ms[as_idx] = k_uptime_get_32();
+			}
 		}
 	}
 }
@@ -903,6 +933,43 @@ static void uac2_sof(struct usbd_class_data *const c_data)
 		 * done during this frame).
 		 */
 		if (ctx->fb_queued & ctx->fb_double & BIT(as_idx)) {
+			uint32_t pending_ms = 0U;
+
+			if ((size_t)as_idx < ARRAY_SIZE(ctx->fb_queued_since_ms)) {
+				pending_ms = k_uptime_get_32() -
+					     ctx->fb_queued_since_ms[as_idx];
+			}
+
+			if (pending_ms < UAC2_FEEDBACK_STALL_TIMEOUT_MS) {
+				continue;
+			}
+
+			/*
+			 * Host hasn't acknowledged either pending feedback write in
+			 * too long — observed in practice: some hosts read the
+			 * feedback endpoint a couple of times at stream start and
+			 * then never again, and without this the flow control above
+			 * would wait forever, permanently starving the host of any
+			 * further feedback value. Cancel the stale transfers so
+			 * their completion callback naturally clears fb_queued/
+			 * fb_double (the is_feedback branch in ep_bi_event_handler
+			 * clears them regardless of completion error code), then
+			 * retry on a later SOF instead of waiting forever.
+			 *
+			 * No logging here deliberately: this runs on the SOF path
+			 * (same real-time context as ctx->ops->sof_cb()), and if the
+			 * host keeps failing to ack, this recovery — and any log
+			 * call in it — could fire every UAC2_FEEDBACK_STALL_TIMEOUT_MS
+			 * instead of once. LOG_INF from inside HAL_SAI_TxCpltCallback
+			 * and uac2_sof_cb() was already confirmed on hardware to
+			 * produce an audible ~1 Hz click purely from formatting/
+			 * queuing cost in a real-time path; a 20x/sec version here
+			 * would be worse. If this needs visibility again, add a
+			 * plain counter field and read it from a deferred/polled
+			 * context instead of logging inline.
+			 */
+			usbd_ep_dequeue(usbd_class_get_ctx(c_data),
+					feedback_ep->bEndpointAddress);
 			continue;
 		}
 
