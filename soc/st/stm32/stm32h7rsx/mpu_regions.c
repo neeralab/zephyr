@@ -40,11 +40,21 @@ static const struct arm_mpu_region mpu_regions[] = {
 	/* Region 5 - Read-only area provisioned by ST */
 	MPU_REGION_ENTRY("ID", 0x08FFF800, REGION_IO_ATTR(REGION_512B)),
 
+#if DT_NODE_HAS_STATUS_OKAY(DT_CHOSEN(zephyr_itcm))
+	/*
+	 * Region 0 marks the entire 4G space XN. ITCM (@0) must be executable
+	 * for XIP-safe XSPI leaf code relocated via zephyr_code_relocate().
+	 * REGION_FLASH_ATTR (unlike REGION_RAM_ATTR) does not set XN under XIP.
+	 */
+	MPU_REGION_ENTRY("ITCM", DT_REG_ADDR(DT_CHOSEN(zephyr_itcm)),
+			 REGION_FLASH_ATTR(REGION_64K)),
+#endif
+
 #if defined(sram_eth_node) && DT_NODE_HAS_STATUS_OKAY(sram_eth_node)
-	/* Region 6 - Ethernet DMA buffer RAM */
+	/* Ethernet DMA buffer RAM */
 	MPU_REGION_ENTRY("SRAM_ETH_BUF", DT_REG_ADDR(sram_eth_node),
 			 REGION_RAM_NOCACHE_ATTR(REGION_16K)),
-	/* Region 7 - Ethernet DMA descriptor RAM (overlays the first 256B of SRAM_ETH_BUF) */
+	/* Ethernet DMA descriptor RAM (overlays the first 256B of SRAM_ETH_BUF) */
 	MPU_REGION_ENTRY("SRAM_ETH_DESC", DT_REG_ADDR(sram_eth_node), REGION_PPB_ATTR(REGION_256B)),
 #endif
 };

@@ -152,6 +152,18 @@ size_t smp_shell_rx_bytes(struct smp_shell_data *data, const uint8_t *bytes,
 			data->buf = net_buf_alloc(data->buf_pool, K_NO_WAIT);
 			if (!data->buf) {
 				LOG_WRN("Failed to alloc SMP buf");
+				/*
+				 * Drop this fragment rather than leaving framing
+				 * half-open with no buffer (corrupt reassembly).
+				 */
+				atomic_clear_bit(&data->esc_state, ESC_MCUMGR_PKT_1);
+				atomic_clear_bit(&data->esc_state, ESC_MCUMGR_PKT_2);
+				atomic_clear_bit(&data->esc_state, ESC_MCUMGR_FRAG_1);
+				atomic_clear_bit(&data->esc_state, ESC_MCUMGR_FRAG_2);
+#ifdef CONFIG_MCUMGR_TRANSPORT_SHELL_INPUT_TIMEOUT
+				k_timer_stop(&smp_shell_input_timer);
+#endif
+				break;
 			}
 		}
 

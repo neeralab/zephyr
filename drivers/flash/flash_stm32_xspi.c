@@ -49,6 +49,10 @@ LOG_MODULE_REGISTER(flash_stm32_xspi, CONFIG_FLASH_LOG_LEVEL);
 
 #include "flash_stm32_xspi.h"
 
+#ifdef CONFIG_FLASH_STM32_XSPI_XIP_SAFE
+#include "flash_stm32_xspi_xip.h"
+#endif
+
 static inline void xspi_lock_thread(const struct device *dev)
 {
 	struct flash_stm32_xspi_data *dev_data = dev->data;
@@ -1033,6 +1037,85 @@ static void stm32_xspi_invalidate_mmap_cache(const struct device *dev, off_t add
 	}
 }
 
+#ifdef CONFIG_FLASH_STM32_XSPI_XIP_SAFE
+static uint32_t xspi_xip_ms_to_cycles(uint32_t ms)
+{
+	return (uint32_t)(((uint64_t)CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC * ms) / 1000U);
+}
+
+static void xspi_xip_fill_timeouts(struct flash_stm32_xspi_xip_timeouts *to, uint32_t wip_ms)
+{
+	to->abort_cycles = xspi_xip_ms_to_cycles(HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	to->cmd_cycles = xspi_xip_ms_to_cycles(HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	to->poll_cycles = xspi_xip_ms_to_cycles(HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	to->xfer_cycles = xspi_xip_ms_to_cycles(HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	to->wip_cycles = xspi_xip_ms_to_cycles(wip_ms);
+}
+
+static void xspi_xip_prepare_wren_rdsr(const struct device *dev,
+				      XSPI_RegularCmdTypeDef *cmd_wren,
+				      XSPI_RegularCmdTypeDef *cmd_rdsr)
+{
+	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
+	uint8_t nor_mode = dev_cfg->data_mode;
+	uint8_t nor_rate = dev_cfg->data_rate;
+
+	*cmd_wren = xspi_prepare_cmd(nor_mode, nor_rate);
+	if (nor_mode == XSPI_OCTO_MODE) {
+		cmd_wren->Instruction = SPI_NOR_OCMD_WREN;
+	} else {
+		cmd_wren->Instruction = SPI_NOR_CMD_WREN;
+		cmd_wren->InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+	}
+	cmd_wren->AddressMode = HAL_XSPI_ADDRESS_NONE;
+	cmd_wren->DataMode = HAL_XSPI_DATA_NONE;
+	cmd_wren->DummyCycles = 0U;
+
+	*cmd_rdsr = xspi_prepare_cmd(nor_mode, nor_rate);
+	if (nor_mode == XSPI_OCTO_MODE) {
+		cmd_rdsr->Instruction = SPI_NOR_OCMD_RDSR;
+		cmd_rdsr->AddressMode = HAL_XSPI_ADDRESS_8_LINES;
+		cmd_rdsr->DataMode = HAL_XSPI_DATA_8_LINES;
+		cmd_rdsr->DummyCycles = (nor_rate == XSPI_DTR_TRANSFER)
+						? SPI_NOR_DUMMY_REG_OCTAL_DTR
+						: SPI_NOR_DUMMY_REG_OCTAL;
+	} else {
+		cmd_rdsr->Instruction = SPI_NOR_CMD_RDSR;
+		cmd_rdsr->InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+		cmd_rdsr->AddressMode = HAL_XSPI_ADDRESS_NONE;
+		cmd_rdsr->DataMode = HAL_XSPI_DATA_1_LINE;
+		cmd_rdsr->DummyCycles = 0;
+	}
+	cmd_rdsr->DataLength = (nor_rate == XSPI_DTR_TRANSFER) ? 2U : 1U;
+	cmd_rdsr->Address = 0U;
+}
+
+static int xspi_xip_program_one(const struct device *dev, XSPI_RegularCmdTypeDef *cmd_pp,
+				off_t addr, const uint8_t *data, size_t len)
+{
+	struct flash_stm32_xspi_data *dev_data = dev->data;
+	XSPI_RegularCmdTypeDef cmd_wren;
+	XSPI_RegularCmdTypeDef cmd_rdsr;
+	struct flash_stm32_xspi_mmap_regs mmap;
+	struct flash_stm32_xspi_xip_timeouts to;
+	int key;
+	int ret;
+
+	cmd_pp->Address = addr;
+	cmd_pp->DataLength = len;
+	xspi_xip_prepare_wren_rdsr(dev, &cmd_wren, &cmd_rdsr);
+	xspi_xip_fill_timeouts(&to, STM32_XSPI_WRITE_REG_MAX_TIME);
+
+	key = irq_lock();
+	flash_stm32_xspi_mmap_save(&dev_data->hxspi, &mmap);
+	ret = flash_stm32_xspi_xip_program(&dev_data->hxspi, &mmap, &cmd_wren, &cmd_rdsr, cmd_pp,
+					   data, len, &to);
+	irq_unlock(key);
+
+	return ret;
+}
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
+
 /*
  * Function to erase the flash : chip or sector with possible OCTO/SPI and STR/DTR
  * to erase the complete chip (using dedicated command) :
@@ -1071,6 +1154,73 @@ static int flash_stm32_xspi_erase(const struct device *dev, off_t addr,
 	const size_t erase_size = size;
 
 	xspi_lock_thread(dev);
+
+#ifdef CONFIG_FLASH_STM32_XSPI_XIP_SAFE
+	/*
+	 * Chip erase holds irq_lock for minutes — not usable under XIP.
+	 * Progressive DFU erases one 4 KiB sector per call/packet.
+	 */
+	if (size >= dev_cfg->flash_size) {
+		LOG_ERR("XIP-safe: chip erase not supported");
+		ret = -ENOTSUP;
+		goto erase_end;
+	}
+
+	{
+		XSPI_RegularCmdTypeDef cmd_wren;
+		XSPI_RegularCmdTypeDef cmd_rdsr;
+		XSPI_RegularCmdTypeDef cmd_erase;
+		struct flash_stm32_xspi_mmap_regs mmap;
+		struct flash_stm32_xspi_xip_timeouts to;
+		int key;
+
+		xspi_xip_prepare_wren_rdsr(dev, &cmd_wren, &cmd_rdsr);
+		xspi_xip_fill_timeouts(&to, STM32_XSPI_SECTOR_ERASE_MAX_TIME);
+
+		cmd_erase = (XSPI_RegularCmdTypeDef){0};
+		cmd_erase.OperationType = HAL_XSPI_OPTYPE_COMMON_CFG;
+		cmd_erase.AlternateBytesMode = HAL_XSPI_ALT_BYTES_NONE;
+		cmd_erase.DataMode = HAL_XSPI_DATA_NONE;
+		cmd_erase.DummyCycles = 0U;
+		cmd_erase.DQSMode = HAL_XSPI_DQS_DISABLE;
+		cmd_erase.InstructionMode = (dev_cfg->data_mode == XSPI_OCTO_MODE)
+						    ? HAL_XSPI_INSTRUCTION_8_LINES
+						    : HAL_XSPI_INSTRUCTION_1_LINE;
+		cmd_erase.InstructionDTRMode = (dev_cfg->data_rate == XSPI_DTR_TRANSFER)
+						       ? HAL_XSPI_INSTRUCTION_DTR_ENABLE
+						       : HAL_XSPI_INSTRUCTION_DTR_DISABLE;
+		cmd_erase.InstructionWidth = (dev_cfg->data_mode == XSPI_OCTO_MODE)
+						     ? HAL_XSPI_INSTRUCTION_16_BITS
+						     : HAL_XSPI_INSTRUCTION_8_BITS;
+		cmd_erase.AddressMode = (dev_cfg->data_mode == XSPI_OCTO_MODE)
+						? HAL_XSPI_ADDRESS_8_LINES
+						: HAL_XSPI_ADDRESS_1_LINE;
+		cmd_erase.AddressDTRMode = (dev_cfg->data_rate == XSPI_DTR_TRANSFER)
+						   ? HAL_XSPI_ADDRESS_DTR_ENABLE
+						   : HAL_XSPI_ADDRESS_DTR_DISABLE;
+		cmd_erase.AddressWidth = stm32_xspi_hal_address_size(dev);
+		cmd_erase.Instruction = (dev_cfg->data_mode == XSPI_OCTO_MODE)
+						? SPI_NOR_OCMD_SE
+						: ((stm32_xspi_hal_address_size(dev) ==
+						    HAL_XSPI_ADDRESS_32_BITS)
+							   ? SPI_NOR_CMD_SE_4B
+							   : SPI_NOR_CMD_SE);
+
+		while ((size > 0) && (ret == 0)) {
+			cmd_erase.Address = (uint32_t)addr;
+
+			key = irq_lock();
+			flash_stm32_xspi_mmap_save(&dev_data->hxspi, &mmap);
+			ret = flash_stm32_xspi_xip_erase(&dev_data->hxspi, &mmap, &cmd_wren,
+							 &cmd_rdsr, &cmd_erase, &to);
+			irq_unlock(key);
+
+			addr += SPI_NOR_SECTOR_SIZE;
+			size -= SPI_NOR_SECTOR_SIZE;
+		}
+	}
+	goto erase_end;
+#else /* !CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
 
 #ifdef CONFIG_FLASH_STM32_NOR_MEMMAP
 	if (stm32_xspi_is_memorymap(dev)) {
@@ -1206,6 +1356,7 @@ static int flash_stm32_xspi_erase(const struct device *dev, off_t addr,
 
 	}
 	/* Ends the erase operation */
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
 
 erase_end:
 	stm32_xspi_invalidate_mmap_cache(dev, erase_addr, erase_size);
@@ -1394,7 +1545,6 @@ static int xspi_dtr_rmword_write(const struct device *dev, XSPI_RegularCmdTypeDe
 {
 	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
 	uint8_t buf[4];
-	XSPI_RegularCmdTypeDef cmd_rd;
 	const off_t base = addr & ~3;
 	const size_t off = (size_t)(addr - base);
 	const size_t n = MIN(size, 4U - off);
@@ -1402,38 +1552,57 @@ static int xspi_dtr_rmword_write(const struct device *dev, XSPI_RegularCmdTypeDe
 
 	*written = 0;
 
-	xspi_prepare_read_cmd(dev, &cmd_rd, base);
-
-	ret = stm32_xspi_mem_ready(dev, dev_cfg->data_mode, dev_cfg->data_rate);
-	if (ret != 0) {
-		return ret;
-	}
-
-	ret = xspi_read_access(dev, &cmd_rd, buf, sizeof(buf));
-	if (ret != 0) {
-		return ret;
-	}
-
-	ret = stm32_xspi_mem_ready(dev, dev_cfg->data_mode, dev_cfg->data_rate);
-	if (ret != 0) {
-		return ret;
-	}
-
+#ifdef CONFIG_FLASH_STM32_XSPI_XIP_SAFE
+	/*
+	 * Read through still-active mmap before the XIP-off window. Do not use
+	 * xspi_read_access() (IT + k_sem) here.
+	 */
+	memcpy(buf, (const void *)(dev_cfg->mem_map_based_address + base), sizeof(buf));
 	memcpy(buf + off, data, n);
-
-	ret = stm32_xspi_write_enable(dev, dev_cfg->data_mode, dev_cfg->data_rate);
+	ret = xspi_xip_program_one(dev, cmd_pp, base, buf, sizeof(buf));
 	if (ret != 0) {
 		return ret;
 	}
-
-	cmd_pp->Address = base;
-	ret = xspi_write_access(dev, cmd_pp, buf, sizeof(buf));
-	if (ret != 0) {
-		return ret;
-	}
-
 	*written = n;
 	return 0;
+#else
+	{
+		XSPI_RegularCmdTypeDef cmd_rd;
+
+		xspi_prepare_read_cmd(dev, &cmd_rd, base);
+
+		ret = stm32_xspi_mem_ready(dev, dev_cfg->data_mode, dev_cfg->data_rate);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = xspi_read_access(dev, &cmd_rd, buf, sizeof(buf));
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = stm32_xspi_mem_ready(dev, dev_cfg->data_mode, dev_cfg->data_rate);
+		if (ret != 0) {
+			return ret;
+		}
+
+		memcpy(buf + off, data, n);
+
+		ret = stm32_xspi_write_enable(dev, dev_cfg->data_mode, dev_cfg->data_rate);
+		if (ret != 0) {
+			return ret;
+		}
+
+		cmd_pp->Address = base;
+		ret = xspi_write_access(dev, cmd_pp, buf, sizeof(buf));
+		if (ret != 0) {
+			return ret;
+		}
+
+		*written = n;
+		return 0;
+	}
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
 }
 
 /* Function to write the flash (page program) : with possible OCTO/SPI and STR/DTR */
@@ -1460,6 +1629,110 @@ static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 	const size_t write_size = size;
 
 	xspi_lock_thread(dev);
+
+#ifdef CONFIG_FLASH_STM32_XSPI_XIP_SAFE
+	/* page program for STR or DTR mode */
+	XSPI_RegularCmdTypeDef cmd_pp = xspi_prepare_cmd(dev_cfg->data_mode, dev_cfg->data_rate);
+
+	cmd_pp.Instruction = dev_data->write_opcode;
+
+	if (dev_cfg->data_mode != XSPI_OCTO_MODE) {
+		switch (cmd_pp.Instruction) {
+		case SPI_NOR_CMD_PP_4B:
+			__fallthrough;
+		case SPI_NOR_CMD_PP: {
+			cmd_pp.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+			cmd_pp.AddressMode = HAL_XSPI_ADDRESS_1_LINE;
+			cmd_pp.DataMode = HAL_XSPI_DATA_1_LINE;
+			break;
+		}
+		case SPI_NOR_CMD_PP_1_1_4_4B:
+			__fallthrough;
+		case SPI_NOR_CMD_PP_1_1_4: {
+			cmd_pp.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+			cmd_pp.AddressMode = HAL_XSPI_ADDRESS_1_LINE;
+			cmd_pp.DataMode = HAL_XSPI_DATA_4_LINES;
+			break;
+		}
+		case SPI_NOR_CMD_PP_1_4_4_4B:
+			__fallthrough;
+		case SPI_NOR_CMD_PP_1_4_4: {
+#if defined(CONFIG_USE_MICROCHIP_QSPI_FLASH_WITH_STM32)
+			cmd_pp.Instruction = SPI_NOR_CMD_PP_1_1_4;
+#endif
+			cmd_pp.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+			cmd_pp.AddressMode = HAL_XSPI_ADDRESS_4_LINES;
+			cmd_pp.DataMode = HAL_XSPI_DATA_4_LINES;
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	cmd_pp.AddressWidth = stm32_xspi_hal_address_size(dev);
+	cmd_pp.DummyCycles = 0U;
+	cmd_pp.DQSMode = HAL_XSPI_DQS_DISABLE;
+
+	LOG_DBG("XSPI XIP-safe write %zu data at 0x%lx", size,
+		(long)(dev_cfg->mem_map_based_address + addr));
+
+	while ((size > 0) && (ret == 0)) {
+		const uint16_t page_size = dev_data->page_size;
+		size_t page_chunk;
+		off_t pos;
+		const uint8_t *src;
+		size_t left;
+
+		to_write = size;
+		if (to_write >= page_size) {
+			to_write = page_size;
+		}
+
+		if (((addr + to_write - 1U) / page_size) != (addr / page_size)) {
+			to_write = page_size - (addr % page_size);
+		}
+
+		page_chunk = to_write;
+		pos = addr;
+		src = data;
+		left = page_chunk;
+
+		while ((left > 0) && (ret == 0)) {
+			size_t part = left;
+			bool use_rmword = false;
+
+			if (dev_cfg->data_rate == XSPI_DTR_TRANSFER) {
+				if ((pos % 4U) != 0U || (left % 4U) != 0U) {
+					if ((pos % 4U) == 0U && left >= 4U) {
+						part = left & ~3U;
+					} else {
+						use_rmword = true;
+					}
+				}
+			}
+
+			if (use_rmword) {
+				ret = xspi_dtr_rmword_write(dev, &cmd_pp, pos, src, left, &part);
+			} else {
+				ret = xspi_xip_program_one(dev, &cmd_pp, pos, src, part);
+				if (ret != 0) {
+					LOG_ERR("XSPI XIP-safe program failed");
+					break;
+				}
+			}
+
+			left -= part;
+			pos += part;
+			src += part;
+		}
+
+		size -= page_chunk;
+		data = (const uint8_t *)data + page_chunk;
+		addr += page_chunk;
+	}
+
+#else /* !CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
 
 #ifdef CONFIG_FLASH_STM32_NOR_MEMMAP
 	if (stm32_xspi_is_memorymap(dev)) {
@@ -1605,6 +1878,7 @@ static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 		addr += page_chunk;
 	}
 	/* Ends the write operation */
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_SAFE */
 
 write_end:
 	stm32_xspi_invalidate_mmap_cache(dev, write_addr, write_size);
@@ -1804,11 +2078,12 @@ static int setup_pages_layout(const struct device *dev)
 		}
 	}
 
-	uint32_t erase_size = BIT(value);
-
-	if (erase_size == 0) {
-		erase_size = SPI_NOR_SECTOR_SIZE;
-	}
+	/*
+	 * value==0 means no SFDP erase types (XIP skip-init path). BIT(0)==1
+	 * must not be treated as a valid erase size — stream_flash would then
+	 * erase 256 B program pages and hit -ENOTSUP in flash_erase().
+	 */
+	uint32_t erase_size = (value == 0U) ? SPI_NOR_SECTOR_SIZE : BIT(value);
 
 	/* We need layout page size to be compatible with erase size */
 	if ((layout_page_size % erase_size) != 0) {
@@ -2287,8 +2562,43 @@ static int flash_stm32_xspi_init(const struct device *dev)
 				return -ENODEV;
 			}
 #endif
+			/*
+			 * SFDP is skipped in this path; fill program defaults from
+			 * DTS so XIP-safe write/erase use valid opcodes/width.
+			 */
+			if (dev_data->write_opcode == SPI_NOR_WRITEOC_NONE) {
+				switch (dev_cfg->data_mode) {
+				case XSPI_OCTO_MODE:
+					dev_data->write_opcode = SPI_NOR_OCMD_PAGE_PRG;
+					break;
+				case XSPI_QUAD_MODE:
+					dev_data->write_opcode = SPI_NOR_CMD_PP_1_4_4;
+					break;
+				case XSPI_DUAL_MODE:
+					dev_data->write_opcode = SPI_NOR_CMD_PP_1_1_2;
+					break;
+				default:
+					dev_data->write_opcode = SPI_NOR_CMD_PP;
+					break;
+				}
+			}
+			if (dev_cfg->data_mode == XSPI_OCTO_MODE ||
+			    dev_cfg->four_byte_opcodes) {
+				dev_data->address_width = 4U;
+				if (dev_cfg->four_byte_opcodes &&
+				    dev_cfg->data_mode == XSPI_SPI_MODE &&
+				    (dev_data->write_opcode == SPI_NOR_CMD_PP ||
+				     dev_data->write_opcode == SPI_NOR_WRITEOC_NONE)) {
+					dev_data->write_opcode = SPI_NOR_CMD_PP_4B;
+				}
+			} else if (dev_data->address_width == 0U) {
+				dev_data->address_width = 3U;
+			}
 			/* Force HAL instance in correct state */
 			dev_data->hxspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
+			/* Semaphores still required for write/erase serialization */
+			k_sem_init(&dev_data->sem, 1, 1);
+			k_sem_init(&dev_data->sync, 0, 1);
 			return 0;
 		}
 	}

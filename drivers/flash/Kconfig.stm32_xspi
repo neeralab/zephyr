@@ -33,4 +33,17 @@ config FLASH_STM32_XSPI_DMA
 	help
 	  Enable the DMA mode for XSPI flash driver instance
 
+config FLASH_STM32_XSPI_XIP_SAFE
+	bool "XIP-safe NOR program/erase (ITCM MMIO leaf)"
+	depends on FLASH_STM32_NOR_MEMMAP && STM32_APP_IN_EXT_FLASH && XIP
+	depends on CPU_CORTEX_M_HAS_DWT
+	select CODE_DATA_RELOCATION
+	select CORTEX_M_DWT
+	default y
+	help
+	  When the application executes in place from the same XSPI NOR that
+	  is being programmed, Abort of memory-mapped mode kills instruction
+	  fetch. Enable a small MMIO leaf relocated to ITCM that runs under
+	  irq_lock with DWT timeouts (no HAL_GetTick / IT / DMA / k_sem).
+
 endif # FLASH_STM32_XSPI

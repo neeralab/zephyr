@@ -1,0 +1,15 @@
+# STMicroelectronics STM32H7RS MCU series defaults
+
+# Copyright (c) 2024 STMicroelectronics
+# Copyright (c) 2026 Neera
+# SPDX-License-Identifier: Apache-2.0
+
+if SOC_SERIES_STM32H7RSX
+
+# Needed so stm32_xspi_invalidate_mmap_cache() can drop stale D-cache lines
+# after XIP-safe NOR program/erase. Only for apps that XIP from external NOR;
+# MCUboot in internal flash must stay within the 64 KiB boot partition.
+config CACHE_MANAGEMENT
+	default y if STM32_APP_IN_EXT_FLASH
+
+endif # SOC_SERIES_STM32H7RSX
