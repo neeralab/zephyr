@@ -141,8 +141,12 @@ static void xspi_config_cmd(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd)
 	__IO uint32_t *ir = &x->IR;
 	__IO uint32_t *abr = &x->ABR;
 
-	/* Indirect / common cfg always uses CCR set. */
-	xspi_cr_clear_modes(x);
+	/*
+	 * Writing IR (or AR, below) is the trigger — it starts the bus
+	 * transaction under whatever FMODE is *already* in CR. Callers must
+	 * set FMODE (and PSMAR/PSMKR/PIR for auto-polling) before calling
+	 * this, matching HAL_XSPI_Command/HAL_XSPI_AutoPolling ordering.
+	 */
 
 	*ccr = cmd->DQSMode;
 
@@ -231,6 +235,7 @@ static int xspi_send_nodata(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd, 
 		return -EIO;
 	}
 
+	xspi_cr_clear_modes(x);
 	xspi_config_cmd(x, cmd);
 
 	if (!xspi_wait_flag(x, XSPI_SR_BUSY, false, cycles)) {
@@ -244,16 +249,17 @@ static int xspi_send_nodata(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd, 
 static int xspi_auto_poll(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd_rdsr,
 			  uint32_t match, uint32_t mask, uint32_t cycles)
 {
-	uint32_t ir_save;
-	uint32_t ar_save;
-
 	if (!xspi_wait_flag(x, XSPI_SR_BUSY, false, cycles)) {
 		xspi_force_ready(x, cycles);
 		return -EIO;
 	}
 
-	xspi_config_cmd(x, cmd_rdsr);
-
+	/*
+	 * FMODE/PSMAR/PSMKR/PIR must be live *before* xspi_config_cmd() writes
+	 * IR/AR (the trigger) — else the RDSR would launch under whatever
+	 * FMODE was previously set (indirect write) and auto-polling would
+	 * never actually engage.
+	 */
 	x->PSMAR = match;
 	x->PSMKR = mask;
 	x->PIR = SPI_NOR_AUTO_POLLING_INTERVAL;
@@ -261,13 +267,7 @@ static int xspi_auto_poll(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd_rds
 		   (HAL_XSPI_MATCH_MODE_AND | HAL_XSPI_AUTOMATIC_STOP_ENABLE |
 		    XSPI_FMODE_AUTO_POLLING));
 
-	ir_save = x->IR;
-	ar_save = x->AR;
-	if ((x->CCR & XSPI_CCR_ADMODE) != HAL_XSPI_ADDRESS_NONE) {
-		x->AR = ar_save;
-	} else {
-		x->IR = ir_save;
-	}
+	xspi_config_cmd(x, cmd_rdsr);
 
 	if (!xspi_wait_flag(x, XSPI_SR_SMF, true, cycles)) {
 		xspi_force_ready(x, cycles);
@@ -292,8 +292,8 @@ static int xspi_transmit(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd_pp,
 		return -EIO;
 	}
 
+	xspi_cr_clear_modes(x);
 	xspi_config_cmd(x, &cmd);
-	MODIFY_REG(x->CR, XSPI_CR_FMODE, XSPI_FMODE_INDIRECT_WRITE);
 
 	while (left > 0U) {
 		if (!xspi_wait_flag(x, XSPI_SR_FTF, true, cycles)) {
