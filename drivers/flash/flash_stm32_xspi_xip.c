@@ -281,19 +281,22 @@ static int xspi_auto_poll(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd_rds
 static int xspi_transmit(XSPI_TypeDef *x, const XSPI_RegularCmdTypeDef *cmd_pp,
 			 const uint8_t *data, size_t len, uint32_t cycles)
 {
-	XSPI_RegularCmdTypeDef cmd = *cmd_pp;
 	__IO uint8_t *dr = (__IO uint8_t *)&x->DR;
 	size_t left = len;
 
-	cmd.DataLength = len;
-
+	/*
+	 * Never do `XSPI_RegularCmdTypeDef cmd = *cmd_pp` here: GCC emits a
+	 * libc memcpy() veneer into NOR (.text @ 0x9xxxxxxx). Memmap is already
+	 * aborted in this window, so that call hangs/faults — typical DFU stall
+	 * at 0–1%. Caller already set Address/DataLength on a stack cmd.
+	 */
 	if (!xspi_wait_flag(x, XSPI_SR_BUSY, false, cycles)) {
 		xspi_force_ready(x, cycles);
 		return -EIO;
 	}
 
 	xspi_cr_clear_modes(x);
-	xspi_config_cmd(x, &cmd);
+	xspi_config_cmd(x, cmd_pp);
 
 	while (left > 0U) {
 		if (!xspi_wait_flag(x, XSPI_SR_FTF, true, cycles)) {
