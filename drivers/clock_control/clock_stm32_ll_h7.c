@@ -932,6 +932,25 @@ static int set_up_plls(void)
 	int r;
 	uint32_t vco_input_range;
 	uint32_t vco_output_range;
+	__maybe_unused bool pll2_keep = false;
+
+#if defined(CONFIG_SOC_SERIES_STM32H7RSX) && defined(CONFIG_FLASH_STM32_NOR_MEMMAP) &&             \
+	defined(CONFIG_BOOTLOADER_MCUBOOT)
+	/* XIP from XSPI1 clocked by PLL2_S/T (set up by MCUboot): PLL2 must stay running. */
+	pll2_keep = (LL_RCC_GetXSPIClockSource(LL_RCC_XSPI1_CLKSOURCE) ==
+		     LL_RCC_XSPI1_CLKSOURCE_PLL2T ||
+		     LL_RCC_GetXSPIClockSource(LL_RCC_XSPI1_CLKSOURCE) ==
+		     LL_RCC_XSPI1_CLKSOURCE_PLL2S) && (LL_RCC_PLL2_IsReady() == 1U);
+
+	/*
+	 * The XSPI kernel clock is asynchronous to HCLK, so the HSI switch below would break XIP
+	 * fetches. MCUboot already brought the PLLs up from the same devicetree: keep them.
+	 */
+	if (pll2_keep && LL_RCC_GetSysClkSource() == LL_RCC_SYS_CLKSOURCE_STATUS_PLL1 &&
+	    LL_RCC_PLL1_IsReady() == 1U) {
+		return 0;
+	}
+#endif
 
 	/*
 	 * Case of chain-loaded applications:
@@ -964,6 +983,11 @@ static int set_up_plls(void)
 		LL_RCC_PLL1_Disable();
 	}
 	if (LL_RCC_GetQSPIClockSource(LL_RCC_QSPI_CLKSOURCE) != LL_RCC_QSPI_CLKSOURCE_PLL2R) {
+		LL_RCC_PLL2_Disable();
+	}
+#elif defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	LL_RCC_PLL1_Disable();
+	if (!pll2_keep) {
 		LL_RCC_PLL2_Disable();
 	}
 #else
@@ -1051,59 +1075,61 @@ static int set_up_plls(void)
 #endif /* STM32_PLL_ENABLED */
 
 #if defined(STM32_PLL2_ENABLED)
-	const uint32_t vco2_ck = PLLX_VCO_FREQ(
-		PLLSRC_FREQ, UINT64_C(STM32_PLL2_M_DIVISOR),
-		STM32_PLL2_N_MULTIPLIER, STM32_PLL2_FRACN_VALUE);
+	if (!pll2_keep) {
+		const uint32_t vco2_ck = PLLX_VCO_FREQ(
+			PLLSRC_FREQ, UINT64_C(STM32_PLL2_M_DIVISOR),
+			STM32_PLL2_N_MULTIPLIER, STM32_PLL2_FRACN_VALUE);
 
-	r = get_vco_parameters(
-		PLLSRC_FREQ / STM32_PLL2_M_DIVISOR, vco2_ck,
-		&vco_input_range, &vco_output_range);
-	if (r < 0) {
-		return r;
-	}
+		r = get_vco_parameters(
+			PLLSRC_FREQ / STM32_PLL2_M_DIVISOR, vco2_ck,
+			&vco_input_range, &vco_output_range);
+		if (r < 0) {
+			return r;
+		}
 
-	LL_RCC_PLL2_SetM(STM32_PLL2_M_DIVISOR);
+		LL_RCC_PLL2_SetM(STM32_PLL2_M_DIVISOR);
 
-	LL_RCC_PLL2_SetVCOInputRange(vco_input_range);
-	LL_RCC_PLL2_SetVCOOutputRange(vco_output_range);
+		LL_RCC_PLL2_SetVCOInputRange(vco_input_range);
+		LL_RCC_PLL2_SetVCOOutputRange(vco_output_range);
 
-	LL_RCC_PLL2_SetN(STM32_PLL2_N_MULTIPLIER);
+		LL_RCC_PLL2_SetN(STM32_PLL2_N_MULTIPLIER);
 
-	LL_RCC_PLL2FRACN_Disable();
-	if (IS_ENABLED(STM32_PLL2_FRACN_ENABLED)) {
-		LL_RCC_PLL2_SetFRACN(STM32_PLL2_FRACN_VALUE);
-		LL_RCC_PLL2FRACN_Enable();
-	}
+		LL_RCC_PLL2FRACN_Disable();
+		if (IS_ENABLED(STM32_PLL2_FRACN_ENABLED)) {
+			LL_RCC_PLL2_SetFRACN(STM32_PLL2_FRACN_VALUE);
+			LL_RCC_PLL2FRACN_Enable();
+		}
 
-	if (IS_ENABLED(STM32_PLL2_P_ENABLED)) {
-		LL_RCC_PLL2_SetP(STM32_PLL2_P_DIVISOR);
-		LL_RCC_PLL2P_Enable();
-	}
+		if (IS_ENABLED(STM32_PLL2_P_ENABLED)) {
+			LL_RCC_PLL2_SetP(STM32_PLL2_P_DIVISOR);
+			LL_RCC_PLL2P_Enable();
+		}
 
-	if (IS_ENABLED(STM32_PLL2_Q_ENABLED)) {
-		LL_RCC_PLL2_SetQ(STM32_PLL2_Q_DIVISOR);
-		LL_RCC_PLL2Q_Enable();
-	}
+		if (IS_ENABLED(STM32_PLL2_Q_ENABLED)) {
+			LL_RCC_PLL2_SetQ(STM32_PLL2_Q_DIVISOR);
+			LL_RCC_PLL2Q_Enable();
+		}
 
-	if (IS_ENABLED(STM32_PLL2_R_ENABLED)) {
-		LL_RCC_PLL2_SetR(STM32_PLL2_R_DIVISOR);
-		LL_RCC_PLL2R_Enable();
-	}
+		if (IS_ENABLED(STM32_PLL2_R_ENABLED)) {
+			LL_RCC_PLL2_SetR(STM32_PLL2_R_DIVISOR);
+			LL_RCC_PLL2R_Enable();
+		}
 
 #if defined(CONFIG_SOC_SERIES_STM32H7RSX)
-	if (IS_ENABLED(STM32_PLL2_S_ENABLED)) {
-		LL_RCC_PLL2_SetS(STM32_PLL2_S_DIVISOR);
-		LL_RCC_PLL2S_Enable();
-	}
+		if (IS_ENABLED(STM32_PLL2_S_ENABLED)) {
+			LL_RCC_PLL2_SetS(STM32_PLL2_S_DIVISOR);
+			LL_RCC_PLL2S_Enable();
+		}
 
-	if (IS_ENABLED(STM32_PLL2_T_ENABLED)) {
-		LL_RCC_PLL2_SetT(STM32_PLL2_T_DIVISOR);
-		LL_RCC_PLL2T_Enable();
-	}
+		if (IS_ENABLED(STM32_PLL2_T_ENABLED)) {
+			LL_RCC_PLL2_SetT(STM32_PLL2_T_DIVISOR);
+			LL_RCC_PLL2T_Enable();
+		}
 
 #endif /* CONFIG_SOC_SERIES_STM32H7RSX */
-	LL_RCC_PLL2_Enable();
-	while (LL_RCC_PLL2_IsReady() != 1U) {
+		LL_RCC_PLL2_Enable();
+		while (LL_RCC_PLL2_IsReady() != 1U) {
+		}
 	}
 
 #endif /* STM32_PLL2_ENABLED */
