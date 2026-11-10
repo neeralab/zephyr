@@ -65,6 +65,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(flash_stm32_xspi, CONFIG_FLASH_LOG_LEVEL);
 
+/* Macronix OPI DTR read dummy cycles, tied to the CR2[0x300] DC field (cycles = 20 - 2 * DC).
+ * MX25UM25645G 16-SOP max DTR clock: 6 cyc 66, 8 cyc 84, 10-12 cyc 104, 14-20 cyc 133 MHz
+ * (24-BGA: 6 cyc 70 ... 18-20 cyc 200 MHz).
+ */
+#define XSPI_NOR_DTR_DUMMY_CYCLES 14U
+#define XSPI_NOR_DTR_CR2_DUMMY    ((20U - XSPI_NOR_DTR_DUMMY_CYCLES) / 2U)
+
 /* Keep log callsites in the driver, but silence them when relocation mode is enabled */
 #if defined(CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION)
 #define XSPI_LOG_DBG(...)
@@ -657,7 +664,6 @@ static int xspi_write_unprotect(const struct device *dev)
 static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
 					uint8_t nor_mode, uint8_t nor_rate)
 {
-	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
 	struct flash_stm32_xspi_data *dev_data = dev->data;
 	uint8_t transmit_data;
 
@@ -665,12 +671,7 @@ static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
 
 	xspi_prepare_cmd(&s_command, nor_mode, nor_rate);
 
-	if (dev_cfg->max_frequency == MHZ(200)) {
-		/* Use memory default value */
-		return 0;
-	}
-
-	transmit_data = SPI_NOR_CR2_DUMMY_CYCLES_66MHZ;
+	transmit_data = XSPI_NOR_DTR_CR2_DUMMY;
 
 	/* Initialize the writing of configuration register 2 */
 	s_command.Instruction = (nor_mode == XSPI_SPI_MODE)
@@ -1017,7 +1018,7 @@ static int stm32_xspi_set_memorymap(struct flash_stm32_xspi_data *dev_data,
 				? ((data_mode == XSPI_SPI_MODE)
 					? SPI_NOR_DUMMY_RD
 					: SPI_NOR_DUMMY_RD_OCTAL)
-				: SPI_NOR_DUMMY_RD_OCTAL_DTR;
+				: XSPI_NOR_DTR_DUMMY_CYCLES;
 	s_command.DQSMode = (data_rate == XSPI_STR_TRANSFER)
 				? HAL_XSPI_DQS_DISABLE
 				: HAL_XSPI_DQS_ENABLE;
@@ -1422,7 +1423,7 @@ static int flash_stm32_xspi_read(const struct device *dev, off_t addr,
 	if (dev_cfg->data_rate == XSPI_DTR_TRANSFER) {
 		/* DTR transfer rate (==> Octal mode) */
 		cmd.Instruction = SPI_NOR_OCMD_DTR_RD;
-		cmd.DummyCycles = SPI_NOR_DUMMY_RD_OCTAL_DTR;
+		cmd.DummyCycles = XSPI_NOR_DTR_DUMMY_CYCLES;
 	} else {
 		/* STR transfer rate */
 		if (dev_cfg->data_mode == XSPI_OCTO_MODE) {
