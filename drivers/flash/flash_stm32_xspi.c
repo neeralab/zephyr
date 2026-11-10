@@ -210,7 +210,12 @@ static int xspi_write_access(struct flash_stm32_xspi_data *dev_data,
 	hal_ret = HAL_XSPI_Transmit(&dev_data->hxspi, (uint8_t *)data,
 				    HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
 #elif defined(CONFIG_FLASH_STM32_XSPI_DMA)
-	hal_ret = HAL_XSPI_Transmit_DMA(&dev_data->hxspi, (uint8_t *)data);
+	/* HPDMA is configured for word access: use IT for sub-4-byte tails. */
+	if ((size % 4U) == 0U) {
+		hal_ret = HAL_XSPI_Transmit_DMA(&dev_data->hxspi, (uint8_t *)data);
+	} else {
+		hal_ret = HAL_XSPI_Transmit_IT(&dev_data->hxspi, (uint8_t *)data);
+	}
 #else /* !CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION && !CONFIG_FLASH_STM32_XSPI_DMA */
 	hal_ret = HAL_XSPI_Transmit_IT(&dev_data->hxspi, (uint8_t *)data);
 #endif /* CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION */
@@ -1452,6 +1457,58 @@ static int flash_stm32_xspi_read(const struct device *dev, off_t addr,
 	*/
 }
 
+/*
+ * Octo-DTR indirect transfers must use a 4-byte aligned address and length. Program a span that
+ * is not aligned (head/tail of a write) with a read-modify-write of one aligned word.
+ * Only used in DTR mode, which implies octal.
+ */
+static int xspi_dtr_rmword_write(const struct device *dev, XSPI_RegularCmdTypeDef *cmd_pp,
+				 off_t addr, const uint8_t *data, size_t size, size_t *written)
+{
+	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
+	struct flash_stm32_xspi_data *dev_data = dev->data;
+	XSPI_RegularCmdTypeDef cmd_rd;
+	uint8_t buf[4];
+	const off_t base = addr & ~3;
+	const size_t off = (size_t)(addr - base);
+	const size_t n = MIN(size, 4U - off);
+	int ret;
+
+	*written = 0;
+
+	xspi_prepare_cmd(&cmd_rd, dev_cfg->data_mode, dev_cfg->data_rate);
+	cmd_rd.Instruction = SPI_NOR_OCMD_DTR_RD;
+	cmd_rd.DummyCycles = XSPI_NOR_DTR_DUMMY_CYCLES;
+	cmd_rd.Address = base;
+	cmd_rd.AddressWidth = stm32_xspi_hal_address_size(dev_data);
+
+	ret = stm32_xspi_mem_ready(dev_data, dev_cfg->data_mode, dev_cfg->data_rate);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = xspi_read_access(dev, &cmd_rd, buf, sizeof(buf));
+	if (ret != 0) {
+		return ret;
+	}
+
+	memcpy(buf + off, data, n);
+
+	ret = stm32_xspi_write_enable(dev_data, dev_cfg->data_mode, dev_cfg->data_rate);
+	if (ret != 0) {
+		return ret;
+	}
+
+	cmd_pp->Address = base;
+	ret = xspi_write_access(dev_data, dev_cfg->data_mode, cmd_pp, buf, sizeof(buf));
+	if (ret != 0) {
+		return ret;
+	}
+
+	*written = n;
+	return 0;
+}
+
 /* Function to write the flash (page program) : with possible OCTO/SPI and STR/DTR */
 static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 				  const void *data, size_t size)
@@ -1565,11 +1622,6 @@ static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 		}
 
 		to_write = size;
-		ret = stm32_xspi_write_enable(dev_data, data_mode, data_rate);
-		if (ret != 0) {
-			XSPI_LOG_ERR("XSPI: write not enabled");
-			goto write_chunk_end;
-		}
 		/* Don't write more than a page. */
 		if (to_write >= SPI_NOR_PAGE_SIZE) {
 			to_write = SPI_NOR_PAGE_SIZE;
@@ -1581,12 +1633,32 @@ static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 			to_write = SPI_NOR_PAGE_SIZE -
 						(addr % SPI_NOR_PAGE_SIZE);
 		}
-		cmd_pp.Address = addr;
 
-		ret = xspi_write_access(dev_data, data_mode, &cmd_pp, data, to_write);
-		if (ret != 0) {
-			XSPI_LOG_ERR("XSPI: write not access");
-			goto write_chunk_end;
+		if (data_rate == XSPI_DTR_TRANSFER && (((addr & 3) != 0) || to_write < 4U)) {
+			/* Unaligned head/tail: read-modify-write one aligned word. */
+			ret = xspi_dtr_rmword_write(dev, &cmd_pp, addr, data, to_write, &to_write);
+			if (ret != 0) {
+				XSPI_LOG_ERR("XSPI: write not access");
+				goto write_chunk_end;
+			}
+		} else {
+			if (data_rate == XSPI_DTR_TRANSFER) {
+				/* Keep the transfer length a multiple of 4. */
+				to_write &= ~3U;
+			}
+
+			ret = stm32_xspi_write_enable(dev_data, data_mode, data_rate);
+			if (ret != 0) {
+				XSPI_LOG_ERR("XSPI: write not enabled");
+				goto write_chunk_end;
+			}
+
+			cmd_pp.Address = addr;
+			ret = xspi_write_access(dev_data, data_mode, &cmd_pp, data, to_write);
+			if (ret != 0) {
+				XSPI_LOG_ERR("XSPI: write not access");
+				goto write_chunk_end;
+			}
 		}
 
 		size -= to_write;
