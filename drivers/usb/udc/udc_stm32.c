@@ -33,6 +33,23 @@
 LOG_MODULE_REGISTER(udc_stm32, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 /*
+ * ISO OUT with an interval of more than one (micro)frame (e.g. HS bInterval=4: one packet per
+ * 8 microframes): the HAL's incomplete-ISO-OUT handling (NAK + disable the endpoint at every
+ * microframe without a packet, re-arm from the driver thread) was written for bInterval=1. At
+ * larger intervals it fires ~7000x/s and the endpoint is often disabled/mis-parity when the
+ * host's packet slot comes, losing packets. Instead: mask the incomplete interrupt, keep the
+ * endpoint armed with the parity of the host's slot (the slot parity is constant because the
+ * interval is an even number of microframes), re-arm it after every packet with the same parity,
+ * and flip the parity if no packet shows up for a while (the initial guess may be wrong).
+ * Only for HAL1 builds (STM32H7RS); HAL2 keeps the old behavior.
+ */
+#ifndef CONFIG_STM32_HAL2
+#define UDC_STM32_ISO_OUT_KEEP_ARMED  1
+#define UDC_STM32_ISO_OUT_RESYNC_US	  4000U
+#define UDC_STM32_ISO_OUT_TIMER_MS	  1U
+#endif
+
+/*
  * Note the #ifdef USB_OTG_HS (HAL2) / #ifdef PCD_SPEED_HIGH (HAL1) check.
  * This is necessary because the High-Speed definitions are not provided
  * if the hardware is not HS-capable but we need values for them anyways.
@@ -188,6 +205,7 @@ enum udc_stm32_msg_type {
 	UDC_STM32_MSG_SETUP,
 	UDC_STM32_MSG_DATA_OUT,
 	UDC_STM32_MSG_DATA_IN,
+	UDC_STM32_MSG_ISO_OUT_RESYNC,
 };
 
 struct udc_stm32_msg {
@@ -205,6 +223,15 @@ struct udc_stm32_data  {
 	struct k_thread thread_data;
 	struct k_msgq msgq_data;
 	char msgq_buf[CONFIG_UDC_STM32_MAX_QMESSAGES * sizeof(struct udc_stm32_msg)];
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	/* Endpoint number of the kept-armed ISO OUT endpoint, 0 = none */
+	uint8_t iso_out_ep;
+	/* Microframe parity (0 even / 1 odd) of the host's packet slot we wait for */
+	uint8_t iso_out_parity;
+	/* Last packet reception / parity flip time */
+	uint32_t iso_out_event_cyc;
+	struct k_timer iso_out_timer;
+#endif
 };
 
 struct udc_stm32_config {
@@ -545,6 +572,42 @@ static int udc_stm32_tx(const struct device *dev, struct udc_ep_config *ep_cfg,
 }
 
 /* Start accepting packets (OUT transfers) */
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+static USB_OTG_OUTEndpointTypeDef *iso_out_regs(struct udc_stm32_data *priv, uint8_t epnum)
+{
+	return (USB_OTG_OUTEndpointTypeDef *)((uint32_t)priv->pcd.Instance +
+					      USB_OTG_OUT_ENDPOINT_BASE +
+					      (epnum * USB_OTG_EP_REG_SIZE));
+}
+
+/* Make the (armed) endpoint accept packets only in microframes of priv->iso_out_parity. */
+static void iso_out_apply_parity(struct udc_stm32_data *priv, uint8_t epnum)
+{
+	USB_OTG_OUTEndpointTypeDef *oep = iso_out_regs(priv, epnum);
+	unsigned int key = irq_lock();
+
+	oep->DOEPCTL |= priv->iso_out_parity ? USB_OTG_DOEPCTL_SODDFRM
+					     : USB_OTG_DOEPCTL_SD0PID_SEVNFRM;
+	irq_unlock(key);
+}
+
+static void iso_out_timer_expiry(struct k_timer *timer)
+{
+	struct udc_stm32_data *priv = k_timer_user_data_get(timer);
+	struct udc_stm32_msg msg = {
+		.type = UDC_STM32_MSG_ISO_OUT_RESYNC,
+		.ep = priv->iso_out_ep,
+	};
+
+	(void)k_msgq_put(&priv->msgq_data, &msg, K_NO_WAIT);
+}
+
+static bool iso_out_is_kept(struct udc_stm32_data *priv, const struct udc_ep_config *ep_cfg)
+{
+	return (priv->iso_out_ep != 0U) && (ep_cfg->addr == (priv->iso_out_ep | USB_EP_DIR_OUT));
+}
+#endif /* UDC_STM32_ISO_OUT_KEEP_ARMED */
+
 static int udc_stm32_initiate_ep_rx(const struct device *dev,
 				    struct udc_ep_config *const ep_cfg,
 				    struct net_buf *const buf)
@@ -600,6 +663,13 @@ static int udc_stm32_initiate_ep_rx(const struct device *dev,
 			ep_cfg->addr, (int)status);
 		return -EIO;
 	}
+
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	if (iso_out_is_kept(priv, ep_cfg)) {
+		/* The HAL armed the endpoint for the next microframe; use the host's slot parity. */
+		iso_out_apply_parity(priv, priv->iso_out_ep);
+	}
+#endif
 
 	/* RX started - mark endpoint as busy */
 	udc_ep_set_busy(ep_cfg, true);
@@ -710,6 +780,12 @@ static void handle_msg_data_out(struct udc_stm32_data *priv, uint8_t epnum, uint
 	struct net_buf *buf;
 
 	LOG_DBG("DataOut ep 0x%02x",  ep);
+
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	if (priv->iso_out_ep != 0U && ep == (priv->iso_out_ep | USB_EP_DIR_OUT)) {
+		priv->iso_out_event_cyc = k_cycle_get_32();
+	}
+#endif
 
 	ep_cfg = udc_get_ep_cfg(dev, ep);
 
@@ -827,6 +903,25 @@ static void handle_msg_data_in(struct udc_stm32_data *priv, uint8_t epnum)
 	}
 }
 
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+/* No packet for a while: our slot-parity guess is probably wrong, try the other parity. */
+static void handle_msg_iso_out_resync(struct udc_stm32_data *priv, uint8_t epnum)
+{
+	const uint32_t now = k_cycle_get_32();
+
+	if (priv->iso_out_ep == 0U || priv->iso_out_ep != epnum) {
+		return;
+	}
+	if (k_cyc_to_us_floor32(now - priv->iso_out_event_cyc) < UDC_STM32_ISO_OUT_RESYNC_US) {
+		return;
+	}
+
+	priv->iso_out_parity ^= 1U;
+	priv->iso_out_event_cyc = now;
+	iso_out_apply_parity(priv, epnum);
+}
+#endif /* UDC_STM32_ISO_OUT_KEEP_ARMED */
+
 void HAL_PCD_SetupStageCallback(stm32_pcd_handle_t *hpcd)
 {
 	struct udc_stm32_data *priv = hpcd2data(hpcd);
@@ -872,6 +967,11 @@ static void udc_stm32_thread_handler(void *arg1, void *arg2, void *arg3)
 		case UDC_STM32_MSG_DATA_OUT:
 			handle_msg_data_out(priv, msg.ep, msg.rx_count);
 			break;
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+		case UDC_STM32_MSG_ISO_OUT_RESYNC:
+			handle_msg_iso_out_resync(priv, msg.ep);
+			break;
+#endif
 		}
 
 		udc_unlock_internal(dev);
@@ -1418,6 +1518,28 @@ static int udc_stm32_ep_enable(const struct device *dev,
 		return -EIO;
 	}
 
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	if (ep_type == STM32_PCD_EP_TYPE_ISOC && USB_EP_DIR_IS_OUT(ep_cfg->addr) &&
+	    ep_cfg->interval > 1U && priv->iso_out_ep == 0U) {
+		USB_OTG_GlobalTypeDef *usb = (USB_OTG_GlobalTypeDef *)priv->pcd.Instance;
+		USB_OTG_DeviceTypeDef *dev_regs =
+			(USB_OTG_DeviceTypeDef *)((uint32_t)usb + USB_OTG_DEVICE_BASE);
+		unsigned int key;
+
+		/* Start with the parity the HAL would use (next microframe). */
+		priv->iso_out_parity = ((dev_regs->DSTS >> 8) & 1U) ^ 1U;
+		priv->iso_out_event_cyc = k_cycle_get_32();
+		priv->iso_out_ep = USB_EP_GET_IDX(ep_cfg->addr);
+
+		key = irq_lock();
+		usb->GINTMSK &= ~USB_OTG_GINTMSK_PXFRM_IISOOXFRM;
+		irq_unlock(key);
+
+		k_timer_start(&priv->iso_out_timer, K_MSEC(UDC_STM32_ISO_OUT_TIMER_MS),
+			      K_MSEC(UDC_STM32_ISO_OUT_TIMER_MS));
+	}
+#endif
+
 	return 0;
 }
 
@@ -1428,6 +1550,20 @@ static int udc_stm32_ep_disable(const struct device *dev,
 	stm32_status_t status;
 
 	LOG_DBG("Disable ep 0x%02x", ep_cfg->addr);
+
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	if (iso_out_is_kept(priv, ep_cfg)) {
+		USB_OTG_GlobalTypeDef *usb = (USB_OTG_GlobalTypeDef *)priv->pcd.Instance;
+		unsigned int key;
+
+		k_timer_stop(&priv->iso_out_timer);
+		priv->iso_out_ep = 0U;
+
+		key = irq_lock();
+		usb->GINTMSK |= USB_OTG_GINTMSK_PXFRM_IISOOXFRM;
+		irq_unlock(key);
+	}
+#endif
 
 	status = hal_udc_close_endpoint(&priv->pcd, ep_cfg->addr);
 	if (status != HAL_OK) {
@@ -1689,6 +1825,10 @@ static int udc_stm32_driver_preinit(const struct device *dev)
 
 	k_msgq_init(&priv->msgq_data, priv->msgq_buf, sizeof(struct udc_stm32_msg),
 		    CONFIG_UDC_STM32_MAX_QMESSAGES);
+#ifdef UDC_STM32_ISO_OUT_KEEP_ARMED
+	k_timer_init(&priv->iso_out_timer, iso_out_timer_expiry, NULL);
+	k_timer_user_data_set(&priv->iso_out_timer, priv);
+#endif
 
 	k_thread_create(&priv->thread_data, cfg->thread_stack,
 			cfg->thread_stack_size, udc_stm32_thread_handler,
