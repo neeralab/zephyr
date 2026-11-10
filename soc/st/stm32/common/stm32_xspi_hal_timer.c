@@ -54,10 +54,11 @@ uint32_t HAL_GetTick(void)
 
 	current_cycles = DWT->CYCCNT;
 	elapsed_cycles = stm32_xspi_dwt_elapsed_cycles(current_cycles, dwt_last);
-	dwt_last = current_cycles;
 
 	elapsed_whole_ms = elapsed_cycles / DWT_CYCLES_PER_MS;
 	elapsed_ms += elapsed_whole_ms;
+	/* Keep the sub-millisecond remainder, otherwise polling faster than 1 ms never advances. */
+	dwt_last += elapsed_whole_ms * DWT_CYCLES_PER_MS;
 
 	return elapsed_ms;
 }
