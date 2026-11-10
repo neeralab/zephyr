@@ -91,7 +91,8 @@ static const struct gpio_dt_spec ulpi_reset =
  * The following defines are used to map the value of the "maxiumum-speed"
  * DT property to the corresponding definition used by the STM32 HAL.
  */
-#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(USB_OTG_HS_EMB_PHYC) || \
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H7RSX) || \
+	defined(USB_OTG_HS_EMB_PHYC) || \
 	defined(USB_OTG_HS_EMB_PHY)
 #define USB_DC_STM32_HIGH_SPEED             USB_OTG_SPEED_HIGH_IN_FULL
 #else
@@ -456,6 +457,32 @@ static int usb_dc_stm32_phy_specific_clock_enable(const struct device *const clk
 
 static int usb_dc_stm32_phy_specific_clock_enable(const struct device *const clk)
 {
+#if defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	RCC_PeriphCLKInitTypeDef periph_clk = {0};
+
+	LL_PWR_EnableUSBHSPHYReg();
+	LL_RCC_SetUSBREFClockSource(LL_RCC_USBREF_CLKSOURCE_24M);
+	LL_RCC_SetUSBPHYCClockSource(LL_RCC_USBPHYC_CLKSOURCE_HSE);
+
+	periph_clk.PeriphClockSelection = RCC_PERIPHCLK_USBPHYC;
+	periph_clk.UsbPhycClockSelection = LL_RCC_USBPHYC_CLKSOURCE_HSE;
+	if (HAL_RCCEx_PeriphCLKConfig(&periph_clk) != HAL_OK) {
+		LOG_ERR("HAL_RCCEx_PeriphCLKConfig(USBPHYC) failed");
+		return -EIO;
+	}
+
+	LL_PWR_EnableUSBVoltageDetector();
+
+	if (clock_control_on(clk, (clock_control_subsys_t)&pclken[0]) != 0) {
+		LOG_ERR("Unable to enable USB clock");
+		return -EIO;
+	}
+
+	__HAL_RCC_USB_OTG_HS_CLK_ENABLE();
+	__HAL_RCC_USBPHYC_CLK_ENABLE();
+
+	return 0;
+#else
 #if defined(PWR_USBSCR_USB33SV) || defined(PWR_SVMCR_USV)
 	/*
 	 * VDDUSB independent USB supply (PWR clock is on)
@@ -502,6 +529,7 @@ static int usb_dc_stm32_phy_specific_clock_enable(const struct device *const clk
 	}
 
 	return 0;
+#endif /* CONFIG_SOC_SERIES_STM32H7RSX */
 }
 
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32u5_otghs_phy) */
@@ -543,6 +571,8 @@ static int usb_dc_stm32_clock_enable(void)
 	 */
 #if defined(CONFIG_SOC_SERIES_STM32H7X)
 	LL_AHB1_GRP1_DisableClockSleep(LL_AHB1_GRP1_PERIPH_USB1OTGHSULPI);
+#elif defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	/* H7RS OTG HS uses embedded USBPHYC; no ULPI clock */
 #elif defined(CONFIG_SOC_SERIES_STM32U5X)
 	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_USBPHY);
 #elif DT_HAS_COMPAT_STATUS_OKAY(st_stm32n6_otghs)
@@ -562,7 +592,7 @@ static int usb_dc_stm32_clock_enable(void)
 #endif
 
 #if USB_OTG_HS_EMB_PHYC
-#if !DT_HAS_COMPAT_STATUS_OKAY(st_stm32n6_otghs)
+#if !DT_HAS_COMPAT_STATUS_OKAY(st_stm32n6_otghs) && !defined(CONFIG_SOC_SERIES_STM32H7RSX)
 	LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_OTGPHYC);
 #endif
 #endif
@@ -646,6 +676,8 @@ static int usb_dc_stm32_init(void)
 		LOG_INF("PWR not active yet");
 		k_sleep(K_MSEC(100));
 	}
+#elif defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	LL_PWR_EnableUSBVoltageDetector();
 #endif
 
 #if !DT_HAS_COMPAT_STATUS_OKAY(st_stm32n6_otghs)
