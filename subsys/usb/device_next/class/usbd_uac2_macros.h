@@ -832,7 +832,7 @@ Apply only for working with non-compliant Windows UAC2 driver"
 	AS_NEXT_IN_EP_ADDR(node),			/* bEndpointAddress */	\
 	0x11,						/* bmAttributes */	\
 	U16_LE(0x04),					/* wMaxPacketSize */	\
-	0x01, /* TODO: adjust to P 5.12.4.2 Feedback */	/* bInterval */
+	0x04, /* bInterval=4 => 2^(4-1)=8 uframes=1ms; standard for UAC2 HS feedback */
 
 #define AS_EXPLICIT_FEEDBACK_HS_DESCRIPTOR_ARRAY(node)				\
 	static uint8_t DESCRIPTOR_NAME(hs_feedback_ep, node)[] = {		\
