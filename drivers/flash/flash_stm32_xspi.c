@@ -1461,12 +1461,15 @@ static int flash_stm32_xspi_read(const struct device *dev, off_t addr,
  * Octo-DTR indirect transfers must use a 4-byte aligned address and length. Program a span that
  * is not aligned (head/tail of a write) with a read-modify-write of one aligned word.
  * Only used in DTR mode, which implies octal.
+ *
+ * Runs with XIP aborted and IRQs locked (RAM relocation): no access to NOR-resident data
+ * (device struct, libc) and no interrupt-driven transfers, so the word is read by polling.
  */
-static int xspi_dtr_rmword_write(const struct device *dev, XSPI_RegularCmdTypeDef *cmd_pp,
-				 off_t addr, const uint8_t *data, size_t size, size_t *written)
+static int xspi_dtr_rmword_write(const struct flash_stm32_xspi_config *dev_cfg,
+				 struct flash_stm32_xspi_data *dev_data,
+				 XSPI_RegularCmdTypeDef *cmd_pp, off_t addr, const uint8_t *data,
+				 size_t size, size_t *written)
 {
-	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
-	struct flash_stm32_xspi_data *dev_data = dev->data;
 	XSPI_RegularCmdTypeDef cmd_rd;
 	uint8_t buf[4];
 	const off_t base = addr & ~3;
@@ -1481,18 +1484,21 @@ static int xspi_dtr_rmword_write(const struct device *dev, XSPI_RegularCmdTypeDe
 	cmd_rd.DummyCycles = XSPI_NOR_DTR_DUMMY_CYCLES;
 	cmd_rd.Address = base;
 	cmd_rd.AddressWidth = stm32_xspi_hal_address_size(dev_data);
+	cmd_rd.DataLength = sizeof(buf);
 
 	ret = stm32_xspi_mem_ready(dev_data, dev_cfg->data_mode, dev_cfg->data_rate);
 	if (ret != 0) {
 		return ret;
 	}
 
-	ret = xspi_read_access(dev, &cmd_rd, buf, sizeof(buf));
-	if (ret != 0) {
-		return ret;
+	if (HAL_XSPI_Command(&dev_data->hxspi, &cmd_rd, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK ||
+	    HAL_XSPI_Receive(&dev_data->hxspi, buf, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
+		return -EIO;
 	}
 
-	memcpy(buf + off, data, n);
+	for (size_t i = 0; i < n; i++) {
+		buf[off + i] = data[i];
+	}
 
 	ret = stm32_xspi_write_enable(dev_data, dev_cfg->data_mode, dev_cfg->data_rate);
 	if (ret != 0) {
@@ -1636,7 +1642,8 @@ static int flash_stm32_xspi_write(const struct device *dev, off_t addr,
 
 		if (data_rate == XSPI_DTR_TRANSFER && (((addr & 3) != 0) || to_write < 4U)) {
 			/* Unaligned head/tail: read-modify-write one aligned word. */
-			ret = xspi_dtr_rmword_write(dev, &cmd_pp, addr, data, to_write, &to_write);
+			ret = xspi_dtr_rmword_write(dev_cfg, dev_data, &cmd_pp, addr, data, to_write,
+					    &to_write);
 			if (ret != 0) {
 				XSPI_LOG_ERR("XSPI: write not access");
 				goto write_chunk_end;
