@@ -97,6 +97,10 @@ struct flash_stm32_xspi_data {
 	uint8_t address_width;
 	/* Read operation dummy cycles */
 	uint8_t read_dummy;
+	/* Octo-DTR read dummy cycles in use (0 = driver default); inherited from the XIP setup
+	 * of the previous boot stage when init is skipped
+	 */
+	uint8_t dtr_dummy;
 	uint32_t read_opcode;
 	uint32_t write_opcode;
 	enum jesd216_mode_type read_mode;

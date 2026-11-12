@@ -72,6 +72,9 @@ LOG_MODULE_REGISTER(flash_stm32_xspi, CONFIG_FLASH_LOG_LEVEL);
 #define XSPI_NOR_DTR_DUMMY_CYCLES 14U
 #define XSPI_NOR_DTR_CR2_DUMMY    ((20U - XSPI_NOR_DTR_DUMMY_CYCLES) / 2U)
 
+/* Octo-DTR dummy cycles of the running configuration (see flash_stm32_xspi_data.dtr_dummy). */
+#define XSPI_DTR_DUMMY(data) ((data)->dtr_dummy != 0U ? (data)->dtr_dummy : XSPI_NOR_DTR_DUMMY_CYCLES)
+
 /* Keep log callsites in the driver, but silence them when relocation mode is enabled */
 #if defined(CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION)
 #define XSPI_LOG_DBG(...)
@@ -1023,7 +1026,7 @@ static int stm32_xspi_set_memorymap(struct flash_stm32_xspi_data *dev_data,
 				? ((data_mode == XSPI_SPI_MODE)
 					? SPI_NOR_DUMMY_RD
 					: SPI_NOR_DUMMY_RD_OCTAL)
-				: XSPI_NOR_DTR_DUMMY_CYCLES;
+				: XSPI_DTR_DUMMY(dev_data);
 	s_command.DQSMode = (data_rate == XSPI_STR_TRANSFER)
 				? HAL_XSPI_DQS_DISABLE
 				: HAL_XSPI_DQS_ENABLE;
@@ -1428,7 +1431,7 @@ static int flash_stm32_xspi_read(const struct device *dev, off_t addr,
 	if (dev_cfg->data_rate == XSPI_DTR_TRANSFER) {
 		/* DTR transfer rate (==> Octal mode) */
 		cmd.Instruction = SPI_NOR_OCMD_DTR_RD;
-		cmd.DummyCycles = XSPI_NOR_DTR_DUMMY_CYCLES;
+		cmd.DummyCycles = XSPI_DTR_DUMMY(dev_data);
 	} else {
 		/* STR transfer rate */
 		if (dev_cfg->data_mode == XSPI_OCTO_MODE) {
@@ -1481,7 +1484,7 @@ static int xspi_dtr_rmword_write(const struct flash_stm32_xspi_config *dev_cfg,
 
 	xspi_prepare_cmd(&cmd_rd, dev_cfg->data_mode, dev_cfg->data_rate);
 	cmd_rd.Instruction = SPI_NOR_OCMD_DTR_RD;
-	cmd_rd.DummyCycles = XSPI_NOR_DTR_DUMMY_CYCLES;
+	cmd_rd.DummyCycles = XSPI_DTR_DUMMY(dev_data);
 	cmd_rd.Address = base;
 	cmd_rd.AddressWidth = stm32_xspi_hal_address_size(dev_data);
 	cmd_rd.DataLength = sizeof(buf);
@@ -2370,6 +2373,19 @@ static int flash_stm32_xspi_init(const struct device *dev)
 				     == CLOCK_CONTROL_STATUS_ON) {
 		if (stm32_xspi_is_memorymap(dev_data)) {
 			LOG_DBG("NOR init'd in MemMapped mode");
+
+			/* Keep the dummy cycles the previous boot stage programmed into the
+			 * NOR/controller: re-arming memory-mapped mode after an erase/write
+			 * with a different count would read garbage.
+			 */
+			if (dev_cfg->data_rate == XSPI_DTR_TRANSFER) {
+				uint32_t dcyc = (dev_data->hxspi.Instance->TCR & XSPI_TCR_DCYC) >>
+						XSPI_TCR_DCYC_Pos;
+
+				if (dcyc != 0U) {
+					dev_data->dtr_dummy = (uint8_t)dcyc;
+				}
+			}
 
 			/* Full init is bypassed when already in XIP ext-flash mode,
 			 * so set required runtime defaults here.
