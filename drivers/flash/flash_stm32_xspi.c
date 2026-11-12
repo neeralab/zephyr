@@ -50,6 +50,9 @@
 #include <zephyr/kernel.h>
 #include <soc.h>
 #include <stm32_bitops.h>
+#if defined(CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER)
+#include <stm32_ll_rcc.h>
+#endif
 #include <zephyr/cache.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/clock_control/stm32_clock_control.h>
@@ -669,17 +672,15 @@ static int xspi_write_unprotect(const struct device *dev)
 }
 
 /* Write Flash configuration register 2 with new dummy cycles */
-static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
+static int stm32_xspi_write_cfg2reg_dummy(struct flash_stm32_xspi_data *dev_data,
 					uint8_t nor_mode, uint8_t nor_rate)
 {
-	struct flash_stm32_xspi_data *dev_data = dev->data;
-	uint8_t transmit_data;
+	/* DTR transfers are two bytes long: repeat the register value */
+	uint8_t transmit_data[2] = {XSPI_NOR_DTR_CR2_DUMMY, XSPI_NOR_DTR_CR2_DUMMY};
 
 	XSPI_RegularCmdTypeDef s_command;
 
 	xspi_prepare_cmd(&s_command, nor_mode, nor_rate);
-
-	transmit_data = XSPI_NOR_DTR_CR2_DUMMY;
 
 	/* Initialize the writing of configuration register 2 */
 	s_command.Instruction = (nor_mode == XSPI_SPI_MODE)
@@ -692,13 +693,13 @@ static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
 
 	if (HAL_XSPI_Command(&dev_data->hxspi, &s_command,
 		HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI transmit cmd");
+		XSPI_LOG_ERR("XSPI transmit cmd");
 		return -EIO;
 	}
 
-	if (HAL_XSPI_Transmit(&dev_data->hxspi, &transmit_data,
+	if (HAL_XSPI_Transmit(&dev_data->hxspi, transmit_data,
 		HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI transmit ");
+		XSPI_LOG_ERR("XSPI transmit ");
 		return -EIO;
 	}
 
@@ -794,7 +795,7 @@ static int stm32_xspi_config_mem(const struct device *dev)
 	}
 
 	/* Write Configuration register 2 (with new dummy cycles) */
-	if (stm32_xspi_write_cfg2reg_dummy(dev,
+	if (stm32_xspi_write_cfg2reg_dummy(dev_data,
 		XSPI_SPI_MODE, XSPI_STR_TRANSFER) != 0) {
 		LOG_ERR("XSPI write CFGR2 failed");
 		return -EIO;
@@ -1092,6 +1093,81 @@ static int stm32_xspi_abort(const struct device *dev)
 
 	return 0;
 }
+
+#if defined(CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER)
+/*
+ * TEMPORARY WORKAROUND - remove (together with CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER) when the
+ * new board revision ships.
+ *
+ * Under XIP the full XSPI/NOR init is skipped when the bootloader already enabled
+ * memory-mapped mode, so the app inherits the bootloader's NOR dummy cycles and XSPI clock.
+ * To keep releases <= 0.1.1 bootable (their set_up_plls() reconfigures PLL2 while running from
+ * NOR) the bootloader runs XSPI on HCLK at ~50 MHz with the chip's default 20 dummy cycles.
+ * Re-tune here, from RAM with XIP aborted and IRQs locked: CR2 dummy cycles, XSPI kernel clock
+ * (PLL2_S) and prescaler to the DTS values, then re-arm memory-mapped mode.
+ */
+static int stm32_xspi_xip_takeover(struct flash_stm32_xspi_data *dev_data, uint8_t data_mode,
+				   uint8_t data_rate, uint32_t prescaler, bool use_pll2s)
+{
+	uint32_t cur_presc = (dev_data->hxspi.Instance->DCR2 & XSPI_DCR2_PRESCALER) >>
+			     XSPI_DCR2_PRESCALER_Pos;
+	bool dummy_ok = (XSPI_DTR_DUMMY(dev_data) == XSPI_NOR_DTR_DUMMY_CYCLES);
+	bool clk_ok = !use_pll2s ||
+		      (LL_RCC_GetXSPIClockSource(LL_RCC_XSPI1_CLKSOURCE) ==
+		       LL_RCC_XSPI1_CLKSOURCE_PLL2S);
+	unsigned int key;
+	int ret = 0;
+
+	if ((data_mode != XSPI_OCTO_MODE) || (data_rate != XSPI_DTR_TRANSFER) ||
+	    (dummy_ok && clk_ok && (cur_presc == prescaler))) {
+		return 0;
+	}
+
+	if (use_pll2s && !LL_RCC_PLL2_IsReady()) {
+		return 0; /* keep the inherited (slow but consistent) setup */
+	}
+
+	key = irq_lock();
+
+	if (HAL_XSPI_Abort(&dev_data->hxspi) != HAL_OK) {
+		irq_unlock(key);
+		return -EIO;
+	}
+
+	if (!dummy_ok) {
+		ret = stm32_xspi_mem_ready(dev_data, data_mode, data_rate);
+		if (ret == 0) {
+			ret = stm32_xspi_write_enable(dev_data, data_mode, data_rate);
+		}
+		if (ret == 0) {
+			ret = stm32_xspi_write_cfg2reg_dummy(dev_data, data_mode, data_rate);
+		}
+		if (ret == 0) {
+			ret = stm32_xspi_mem_ready(dev_data, data_mode, data_rate);
+		}
+		if (ret == 0) {
+			dev_data->dtr_dummy = XSPI_NOR_DTR_DUMMY_CYCLES;
+		}
+	}
+
+	if (ret == 0) {
+		if (use_pll2s && !clk_ok) {
+			LL_RCC_SetXSPIClockSource(LL_RCC_XSPI1_CLKSOURCE_PLL2S);
+		}
+		if (HAL_XSPI_SetClockPrescaler(&dev_data->hxspi, prescaler) == HAL_OK) {
+			dev_data->hxspi.Init.ClockPrescaler = prescaler;
+		}
+	}
+
+	/* Always return to memory-mapped mode, even after a failure above. */
+	if (stm32_xspi_set_memorymap(dev_data, data_mode, data_rate) != 0) {
+		ret = -EIO; /* XIP is gone; nothing sensible left to do */
+	}
+
+	irq_unlock(key);
+	return ret;
+}
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER */
 
 /* Function to return true if the octoflash is in MemoryMapped else false */
 static bool stm32_xspi_is_memorymap(struct flash_stm32_xspi_data *dev_data)
@@ -2413,6 +2489,32 @@ static int flash_stm32_xspi_init(const struct device *dev)
 
 			/* Force HAL instance in correct state */
 			dev_data->hxspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
+
+#if defined(CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER)
+			/* TEMPORARY WORKAROUND (see stm32_xspi_xip_takeover()) */
+			if (dev_cfg->has_pclken_ker) {
+				uint32_t kfreq = 0U;
+				uint32_t presc = STM32_XSPI_CLOCK_PRESCALER_MIN;
+
+				if (clock_control_get_rate(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
+						(clock_control_subsys_t)&dev_cfg->pclken_ker,
+						&kfreq) == 0) {
+					for (; presc < STM32_XSPI_CLOCK_PRESCALER_MAX; presc++) {
+						if (STM32_XSPI_CLOCK_COMPUTE(kfreq, presc) <=
+						    dev_cfg->max_frequency) {
+							break;
+						}
+					}
+
+					ret = stm32_xspi_xip_takeover(dev_data, dev_cfg->data_mode,
+						dev_cfg->data_rate, presc,
+						dev_cfg->pclken_ker.bus == STM32_SRC_PLL2_S);
+					if (ret != 0) {
+						LOG_ERR("XSPI XIP takeover failed (%d)", ret);
+					}
+				}
+			}
+#endif /* CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER */
 
 			/* Run IRQ init */
 			dev_cfg->irq_config(dev);
