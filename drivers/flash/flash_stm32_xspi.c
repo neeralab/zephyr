@@ -1167,6 +1167,23 @@ static int stm32_xspi_xip_takeover(struct flash_stm32_xspi_data *dev_data, uint8
 	irq_unlock(key);
 	return ret;
 }
+
+/*
+ * XSPI1 pads only reach the tuned clock with the XSPI1_HSLV option byte set. Until the app has
+ * provisioned it (after confirming its image), stay on the boot stage's slow, safe setup.
+ */
+static bool stm32_xspi_xip_takeover_pads_ok(const struct flash_stm32_xspi_data *dev_data)
+{
+#if defined(FLASH_OBW1SR_XSPI1_HSLV)
+	if ((dev_data->hxspi.Instance == XSPI1) &&
+	    ((FLASH->OBW1SR & FLASH_OBW1SR_XSPI1_HSLV) == 0U)) {
+		return false;
+	}
+#else
+	ARG_UNUSED(dev_data);
+#endif
+	return true;
+}
 #endif /* CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER */
 
 /* Function to return true if the octoflash is in MemoryMapped else false */
@@ -2492,7 +2509,9 @@ static int flash_stm32_xspi_init(const struct device *dev)
 
 #if defined(CONFIG_FLASH_STM32_XSPI_XIP_TAKEOVER)
 			/* TEMPORARY WORKAROUND (see stm32_xspi_xip_takeover()) */
-			if (dev_cfg->has_pclken_ker) {
+			if (!stm32_xspi_xip_takeover_pads_ok(dev_data)) {
+				LOG_WRN("XSPI1_HSLV not set: keeping the boot stage's XSPI clock");
+			} else if (dev_cfg->has_pclken_ker) {
 				uint32_t kfreq = 0U;
 				uint32_t presc = STM32_XSPI_CLOCK_PRESCALER_MIN;
 
