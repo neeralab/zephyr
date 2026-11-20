@@ -934,6 +934,25 @@ static int cdc_acm_fifo_fill(const struct device *dev,
 	return done;
 }
 
+/*
+ * fifo_fill() only enqueues a buffer once it is full; inside the UART IRQ API the irq_cb handler
+ * flushes the rest. cdc_acm_uart_write() has no such callback, so a short write (one line) would
+ * sit in tx_fifo.current until unrelated TX came along: queue it now. If a transfer is already
+ * in flight, its completion schedules the leftover instead.
+ */
+static int cdc_acm_uart_write_fill(const struct device *dev, const uint8_t *data, size_t len)
+{
+	struct cdc_acm_uart_data *const ud = dev->data;
+	const int done = cdc_acm_fifo_fill(dev, data, len);
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&ud->lock);
+	cdc_acm_tx_schedule_leftover_locked(ud);
+	k_spin_unlock(&ud->lock, key);
+
+	return done;
+}
+
 #if CONFIG_USBD_CDC_ACM_WORKQUEUE
 static void cdc_acm_async_tx_handler(struct k_work *work)
 {
@@ -941,7 +960,7 @@ static void cdc_acm_async_tx_handler(struct k_work *work)
 	const size_t len = data->async_tx_len;
 
 	data->async_tx_len = 0U;
-	(void)cdc_acm_fifo_fill(data->dev, data->async_tx_buf, len);
+	(void)cdc_acm_uart_write_fill(data->dev, data->async_tx_buf, len);
 }
 #endif
 
@@ -959,7 +978,7 @@ int cdc_acm_uart_write(const struct device *dev, const uint8_t *data, size_t len
 	struct cdc_acm_uart_data *const ud = dev->data;
 
 	if (check_wq_ctx(dev)) {
-		return cdc_acm_fifo_fill(dev, data, len);
+		return cdc_acm_uart_write_fill(dev, data, len);
 	}
 
 	if (k_work_busy_get(&ud->async_tx_work) != 0) {
@@ -971,7 +990,7 @@ int cdc_acm_uart_write(const struct device *dev, const uint8_t *data, size_t len
 
 	return cdc_acm_work_submit(&ud->async_tx_work) >= 0 ? (int)len : -EIO;
 #else
-	return cdc_acm_fifo_fill(dev, data, len);
+	return cdc_acm_uart_write_fill(dev, data, len);
 #endif
 }
 
